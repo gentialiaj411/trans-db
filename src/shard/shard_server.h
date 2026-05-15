@@ -1,0 +1,85 @@
+#pragma once
+
+#include "raft/raft_node.h"
+#include "raft/raft_state_machine.h"
+#include "raft/raft_transport.h"
+#include "shard.grpc.pb.h"
+#include "storage/mvcc_store.h"
+#include "txn/lock_manager.h"
+#include "txn/txn_manager.h"
+#include "txn/wal.h"
+
+#include <grpcpp/grpcpp.h>
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace txndb {
+
+struct ReplicaStack {
+  std::unique_ptr<MVCCStore> store;
+  std::unique_ptr<WAL> wal;
+  std::unique_ptr<LockManager> lock_mgr;
+  std::unique_ptr<TxnManager> txn_mgr;
+  std::unique_ptr<RaftStateMachine> state_machine;
+  std::unique_ptr<RaftNode> raft_node;
+};
+
+class ShardServiceImpl final : public ShardService::Service {
+public:
+  ShardServiceImpl(uint32_t shard_id, const std::string& data_dir, uint32_t num_replicas = 3);
+  ~ShardServiceImpl();
+
+  void Start();
+  void Stop();
+
+  grpc::Status Execute(grpc::ServerContext* context, const ExecuteRequest* request,
+                       ExecuteResponse* response) override;
+
+  grpc::Status Prepare(grpc::ServerContext* context, const PrepareRequest* request,
+                       PrepareResponse* response) override;
+
+  grpc::Status Commit(grpc::ServerContext* context, const CommitRequest* request,
+                      CommitResponse* response) override;
+
+  grpc::Status Abort(grpc::ServerContext* context, const AbortRequest* request,
+                     AbortResponse* response) override;
+
+  MVCCStore* GetReplicaStore(uint32_t replica_id);
+  TxnManager* GetReplicaTxnMgr(uint32_t replica_id);
+  /// Leader's MVCC store (for tests).
+  MVCCStore* GetLeaderStore();
+
+private:
+  ReplicaStack* FindLeader();
+  bool ProposeAndWait(RaftEntryType type, std::string payload,
+                      std::chrono::milliseconds timeout = std::chrono::milliseconds(5000));
+
+  uint32_t shard_id_{0};
+  std::string data_dir_;
+  bool started_{false};
+
+  InProcessTransport transport_;
+  std::vector<std::unique_ptr<ReplicaStack>> replicas_;
+};
+
+class ShardServer {
+public:
+  ShardServer(uint32_t shard_id, const std::string& data_dir, const std::string& listen_addr);
+  ~ShardServer();
+
+  void Start();
+  void Stop();
+  void Wait();
+
+  ShardServiceImpl* GetService() { return &service_; }
+
+private:
+  ShardServiceImpl service_;
+  std::string listen_addr_;
+  std::unique_ptr<grpc::Server> server_;
+};
+
+}  // namespace txndb

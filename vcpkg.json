@@ -1,0 +1,8 @@
+{
+  "dependencies": [
+    "rocksdb",
+    "gtest",
+    "grpc",
+    "protobuf"
+  ]
+}

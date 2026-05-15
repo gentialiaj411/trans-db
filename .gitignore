@@ -1,0 +1,9 @@
+/build/
+/out/
+# Local vcpkg manifest mode install — never commit binaries (keep vcpkg.json only).
+/vcpkg_installed/
+CMakeUserPresets.json
+compile_commands.json
+.vs/
+*.db/
+**/*.log
