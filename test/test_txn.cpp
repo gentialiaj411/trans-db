@@ -442,3 +442,46 @@ TEST(TxnManager, RecoverPreparedTxn) {
   Nuke(store_path);
   Nuke(wal_path);
 }
+
+TEST_F(TxnEnv, SerializabilityWriteSkew) {
+  ASSERT_TRUE(store->Put(9, "A", 1, "10").ok());
+  ASSERT_TRUE(store->Put(9, "B", 1, "10").ok());
+
+  uint64_t t1 = tm->Begin(2);
+  uint64_t t2 = tm->Begin(2);
+
+  std::string a_val;
+  ASSERT_TRUE(tm->Read(t1, 9, "A", &a_val).ok());
+  EXPECT_EQ(a_val, "10");
+  ASSERT_TRUE(tm->Write(t1, 9, "B", "0").ok());
+
+  std::string b_val;
+  ASSERT_TRUE(tm->Read(t2, 9, "B", &b_val).ok());
+  EXPECT_EQ(b_val, "10");
+  ASSERT_TRUE(tm->Write(t2, 9, "A", "0").ok());
+  ASSERT_TRUE(tm->Prepare(t2, 3).ok());
+  ASSERT_TRUE(tm->Commit(t2, 3).ok());
+
+  EXPECT_EQ(tm->Prepare(t1, 4).code(), StatusCode::Conflict);
+}
+
+TEST_F(TxnEnv, PhantomReadSnapshotBehavior) {
+  ASSERT_TRUE(store->Put(10, "row:1", 1, "val1").ok());
+  ASSERT_TRUE(store->Put(10, "row:3", 1, "val3").ok());
+
+  uint64_t t1 = tm->Begin(2);
+  std::string v1;
+  std::string v3;
+  ASSERT_TRUE(tm->Read(t1, 10, "row:1", &v1).ok());
+  ASSERT_TRUE(tm->Read(t1, 10, "row:3", &v3).ok());
+  EXPECT_EQ(v1, "val1");
+  EXPECT_EQ(v3, "val3");
+
+  uint64_t t2 = tm->Begin(2);
+  ASSERT_TRUE(tm->Write(t2, 10, "row:2", "val2").ok());
+  ASSERT_TRUE(tm->CommitSingleShard(t2, 3).ok());
+
+  std::string phantom;
+  // MVCC snapshot filter correctly blocks phantom at key granularity.
+  EXPECT_FALSE(tm->Read(t1, 10, "row:2", &phantom).ok());
+}
