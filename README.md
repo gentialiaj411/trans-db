@@ -1,24 +1,130 @@
 # trans-db
 
-Sharded distributed OLTP database (C++20) per [`distributed-db-spec.md`](../../distributed-db-spec.md) alongside this repo under `PROJECTS`.
+A distributed transactional database built from scratch in C++20. It provides serializable transactions across sharded data using MVCC, strict 2PL, two-phase commit, and Raft replication. Clients connect through PostgreSQL wire protocol v3, so `psql` works directly.
 
-## Current status
+## Features
+- Serializable isolation via MVCC + strict 2PL + read-set validation
+- Distributed transactions with coordinator-driven 2PC across hash-sharded keys
+- Raft replication (3 replicas per shard) for fault tolerance
+- PostgreSQL wire protocol v3 (simple + extended query support)
+- SQL support: `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `BEGIN/COMMIT/ROLLBACK`
+- Crash/fault test coverage including restart scenarios, contention, and large payloads
+- TPC-C-inspired benchmark harness with throughput and latency metrics
 
-**Phase 1 (storage)** and **Phase 2 (txn)** are implemented: MVCC layer; `LockManager`; append-only **WAL** with CRC replay; `TxnManager` (`Begin`/`Read`/`Write`/`Delete`, `Prepare`/`Commit`/`Abort`, `CommitSingleShard`, `Recover`). Tests: `test/test_mvcc_store.cpp`, `test/test_txn.cpp`.
-
-## Build (Windows + vcpkg)
-
-```powershell
-# Set VCPKG_ROOT to your installation (example: C:\tools\vcpkg)
-# One-time: install vcpkg and integrate (see https://github.com/microsoft/vcpkg)
-$env:VCPKG_ROOT = "C:\tools\vcpkg"
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
-cmake --build build --config Release
-ctest --test-dir build -C Release
+## Architecture
+```text
+                    +-----------------------------+
+                    |        PostgreSQL Client    |
+                    |      (psql / pgbench)       |
+                    +--------------+--------------+
+                                   |
+                            PgWire v3 (TCP)
+                                   |
+                  +----------------v----------------+
+                  |           PgWireServer          |
+                  +----------------+----------------+
+                                   |
+                        +----------v----------+
+                        |      Coordinator    |
+                        |  SQL Parser/Exec    |
+                        |  2PC + Routing      |
+                        +----+-----------+----+
+                             |           |
+                    gRPC/Raft Txn RPCs   |
+                             |           |
+      +----------------------+--+     +--+----------------------+
+      |       Shard 0           | ... |        Shard N-1         |
+      | (3 Raft replicas total) |     | (3 Raft replicas total)  |
+      +-----------+-------------+     +------------+-------------+
+                  |                                |
+      +-----------v-------------+      +-----------v-------------+
+      | TxnManager + LockMgr    |      | TxnManager + LockMgr    |
+      | WAL + RaftStateMachine  |      | WAL + RaftStateMachine  |
+      +-----------+-------------+      +-----------+-------------+
+                  |                                |
+              +---v---+                        +---v---+
+              | RocksDB|                        | RocksDB|
+              |  MVCC  |                        |  MVCC  |
+              +--------+                        +--------+
 ```
 
-Dependencies are listed in `vcpkg.json` (`rocksdb`, `gtest`).
+## Quick Start
+```bash
+git clone <repo>
+cd trans-db
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=C:/tools/vcpkg/scripts/buildsystems/vcpkg.cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+```
 
-## Next steps
+Run server:
+```bash
+./build/Release/trans_db_server --port 5433 --shards 3 --data-dir ./data
+```
 
-Phase 3: Raft consensus (`src/raft/`, protos, gRPC — see spec).
+Connect:
+```bash
+psql -h localhost -p 5433
+```
+
+Docker:
+```bash
+docker-compose -f docker/docker-compose.yml up --build
+psql -h localhost -p 5432
+```
+
+## TPC-C Benchmark (Simplified)
+Run:
+```bash
+./build/Release/bench_tpcc --shards 3 --threads 1 --duration 10 --warmup 0 --warehouses 1 --customers 20
+```
+
+Benchmarked on **Intel Core Ultra 9 275HX**, Windows 11, Release build.
+
+| Metric | Value |
+|---|---:|
+| Throughput | 2.67 txn/sec |
+| Latency p50 | 373,457.70 us |
+| Latency p99 | 467,840.80 us |
+| Abort rate | 3.57% |
+| Committed | 27 |
+| Aborted | 1 |
+| New-Order | 18 |
+| Payment | 9 |
+
+## Tests
+`ctest --test-dir build -C Release --output-on-failure`
+
+Current status: **75 tests total** (67 existing + 8 fault tests), all passing in Release CI run.
+
+| Suite | Tests |
+|---|---:|
+| mvcc_store | 8 |
+| txn | 18 |
+| raft | 10 |
+| e2e | 11 |
+| parser | 12 |
+| pgwire | 8 |
+| fault | 8 |
+
+## Project Structure
+```text
+src/
+  storage/      MVCC store + iterators + key encoding
+  txn/          lock manager, WAL, transaction manager
+  raft/         raft log/node/transport/state machine
+  shard/        shard gRPC service + 3-replica raft stack
+  coordinator/  catalog, parser, executor, coordinator (2PC)
+  pgwire/       PostgreSQL wire protocol server
+bench/
+  tpcc.*        schema/data loader
+  benchmark.*   workload runner + metrics
+  main_bench.cpp
+proto/
+  shard.proto
+test/
+  test_*.cpp
+
+docker/
+  Dockerfile
+  docker-compose.yml
+```

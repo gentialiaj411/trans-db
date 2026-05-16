@@ -16,6 +16,7 @@ enum class RaftEntryType : uint8_t {
   TXN_COMMIT = 5,
   TXN_ABORT = 6,
   NOOP = 7,
+  TXN_PREPARE_BATCH = 8,
 };
 
 struct RaftLogEntry {

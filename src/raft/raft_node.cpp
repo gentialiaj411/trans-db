@@ -56,6 +56,7 @@ void RaftNode::BecomeLeaderLocked() {
     match_index_[p] = 0;
   }
   last_broadcast_ = std::chrono::steady_clock::time_point{};
+  immediate_replicate_ = true;
   log_.Append(current_term_, RaftEntryType::NOOP, "");
 }
 
@@ -237,8 +238,10 @@ void RaftNode::TickOnce() {
     const bool heartbeat_due =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_broadcast_) >=
         kHeartbeatInterval;
+    const bool should_send = immediate_replicate_ || heartbeat_due;
+    immediate_replicate_ = false;
     lk.unlock();
-    if (heartbeat_due) {
+    if (should_send) {
       SendAppendEntriesToAll();
     }
     lk.lock();
@@ -299,6 +302,7 @@ uint64_t RaftNode::Propose(RaftEntryType type, std::string payload) {
     return 0;
   }
   const uint64_t idx = log_.Append(current_term_, type, std::move(payload));
+  immediate_replicate_ = true;
   cv_.notify_all();
   return idx;
 }

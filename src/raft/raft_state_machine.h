@@ -10,10 +10,10 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace txndb {
 
-/// Result of applying a TXN_PREPARE entry (consume with TakePrepareResult).
 struct PrepareResult {
   bool success{false};
   std::string error;
@@ -21,26 +21,35 @@ struct PrepareResult {
 
 class RaftStateMachine {
 public:
+  struct PrepareBatchWrite {
+    bool is_delete{false};
+    uint32_t table_id{0};
+    std::string key;
+    std::string value;
+  };
+
   explicit RaftStateMachine(TxnManager* txn_mgr);
 
-  /// WAL serialization + raft_txn_id (8-byte LE suffix), except abort (use PackAbortPayload).
   static std::string PackTxnPayload(std::string_view wal_payload, uint64_t raft_txn_id);
-
-  /// TXN_ABORT full payload — 8-byte LE raft_txn_id only.
   static std::string PackAbortPayload(uint64_t raft_txn_id);
+  static std::string PackPrepareBatchPayload(uint64_t raft_txn_id, uint64_t snapshot_ts,
+                                             uint64_t commit_ts,
+                                             const std::vector<PrepareBatchWrite>& writes);
 
   void Apply(const RaftLogEntry& entry);
-
   std::function<void(const RaftLogEntry& entry)> WrapApply();
 
   uint64_t GetLocalTxnId(uint64_t raft_txn_id) const;
-
-  /// Returned once per raft_txn_id after prepare commits; erased when taken.
   std::optional<PrepareResult> TakePrepareResult(uint64_t raft_txn_id);
+  void RegisterLocalTxn(uint64_t raft_txn_id, uint64_t local_txn_id);
+  void ForgetTxn(uint64_t raft_txn_id);
 
 private:
   static bool UnpackPayload(std::string_view full_payload, std::string* wal_payload,
-                           uint64_t* raft_txn_id);
+                            uint64_t* raft_txn_id);
+  static bool UnpackPrepareBatchPayload(std::string_view payload, uint64_t* raft_txn_id,
+                                        uint64_t* snapshot_ts, uint64_t* commit_ts,
+                                        std::vector<PrepareBatchWrite>* writes);
 
   TxnManager* txn_mgr_{nullptr};
   mutable std::mutex mu_;

@@ -145,6 +145,19 @@ add_executable(test_parser test/test_parser.cpp)
 target_link_libraries(test_parser PRIVATE trans_db_sql GTest::gtest_main)
 add_test(NAME parser COMMAND test_parser)
 
+# Benchmark library
+add_library(trans_db_bench
+  bench/tpcc.cpp
+  bench/benchmark.cpp
+)
+target_include_directories(trans_db_bench PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(trans_db_bench PUBLIC trans_db_sql trans_db_shard)
+
+# Benchmark executable
+add_executable(bench_tpcc bench/main_bench.cpp)
+target_link_libraries(bench_tpcc PRIVATE trans_db_bench trans_db_pgwire)
+target_compile_definitions(bench_tpcc PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+
 add_executable(test_pgwire test/test_pgwire.cpp)
 target_include_directories(test_pgwire PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_pgwire PRIVATE trans_db_pgwire trans_db_shard GTest::gtest_main)
@@ -153,3 +166,12 @@ if(WIN32)
   target_link_libraries(test_pgwire PRIVATE ws2_32)
 endif()
 add_test(NAME pgwire COMMAND test_pgwire)
+
+# Fault injection tests
+add_executable(test_fault test/test_fault.cpp)
+target_link_libraries(test_fault PRIVATE trans_db_bench trans_db_pgwire GTest::gtest_main)
+target_compile_definitions(test_fault PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+if(WIN32)
+  target_link_libraries(test_fault PRIVATE ws2_32)
+endif()
+add_test(NAME fault COMMAND test_fault)

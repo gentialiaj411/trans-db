@@ -58,7 +58,7 @@ protected:
   void SetUp() override {
     std::srand(static_cast<unsigned>(std::chrono::steady_clock::now().time_since_epoch().count()));
     base_dir_ = UniqueBase();
-    const int base_port = 55451 + (std::rand() % 2000);
+    const int base_port = 30000 + (std::rand() % 10000);
     std::unordered_map<uint32_t, std::string> addrs;
 
     for (uint32_t i = 0; i < kShards; ++i) {

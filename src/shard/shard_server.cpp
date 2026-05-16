@@ -50,6 +50,9 @@ ShardServiceImpl::ShardServiceImpl(uint32_t shard_id, const std::string& data_di
     stack->lock_mgr = std::make_unique<LockManager>();
     stack->txn_mgr =
         std::make_unique<TxnManager>(stack->store.get(), stack->wal.get(), stack->lock_mgr.get());
+    if (!stack->txn_mgr->Recover().ok()) {
+      throw std::runtime_error("TxnManager::Recover failed");
+    }
     stack->state_machine = std::make_unique<RaftStateMachine>(stack->txn_mgr.get());
 
     std::vector<uint32_t> peers;

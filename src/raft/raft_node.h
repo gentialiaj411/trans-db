@@ -128,6 +128,7 @@ private:
   std::condition_variable cv_;
   std::atomic<bool> running_{false};
   std::unique_ptr<std::thread> tick_thread_;
+  bool immediate_replicate_{false};
 
   static constexpr auto kHeartbeatInterval = std::chrono::milliseconds(50);
   static constexpr auto kElectionTimeoutMin = std::chrono::milliseconds(150);
