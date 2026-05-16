@@ -72,7 +72,7 @@ private:
 
   std::mutex mu_;
   uint64_t next_txn_id_{1};
-  std::unordered_map<uint64_t, CoordinatorTxn> txns_;
+  std::unordered_map<uint64_t, std::shared_ptr<CoordinatorTxn>> txns_;
 
   std::unordered_map<uint32_t, std::shared_ptr<grpc::Channel>> channels_;
   std::unordered_map<uint32_t, std::unique_ptr<ShardService::Stub>> stubs_;

@@ -89,27 +89,27 @@ Benchmarked on **Intel Core Ultra 9 275HX**, Windows 11, Release build.
 
 | Metric | Value |
 |---|---:|
-| Throughput | 0.93 txn/sec |
-| Latency p50 | 63,969.90 us |
-| Latency p99 | 5,226,064.60 us |
-| Abort rate | 30.95% |
-| Committed | 29 |
-| Aborted | 13 |
-| New-Order | 16 |
-| Payment | 13 |
+| Throughput | 638.24 txn/sec |
+| Latency p50 | 3,281.50 us |
+| Latency p99 | 4,662.40 us |
+| Abort rate | 50.65% |
+| Committed | 19,152 |
+| Aborted | 19,660 |
+| New-Order | 10,858 |
+| Payment | 8,294 |
 
 1-thread result (`--shards 3 --threads 1 --duration 30 --warmup 5 --warehouses 2`):
 
 | Metric | Value |
 |---|---:|
-| Throughput | 37.20 txn/sec |
-| Latency p50 | 31,253.80 us |
-| Latency p99 | 32,746.50 us |
+| Throughput | 441.44 txn/sec |
+| Latency p50 | 2,632.90 us |
+| Latency p99 | 3,313.90 us |
 | Abort rate | 0.00% |
-| Committed | 1116 |
+| Committed | 13,247 |
 | Aborted | 0 |
-| New-Order | 681 |
-| Payment | 435 |
+| New-Order | 7,921 |
+| Payment | 5,326 |
 
 ## Tests
 `ctest --test-dir build -C Release --output-on-failure`

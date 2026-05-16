@@ -1,0 +1,84 @@
+# Dependencies
+node_modules/
+vendor/
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+out/
+target/
+bin/
+obj/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
+*.pdb
+
+# Caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.gradle/
+.next/
+.nuxt/
+.sass-cache/
+__pycache__/
+*.pyc
+
+# Coverage
+coverage/
+coverage-*/
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Databases and local data files
+*.db
+*.sqlite
+*.sqlite3
+*.mdb
+
+# Logs and runtime dumps
+*.log
+logs/
+log/
+*.out
+*.err
+*.pid
+*.stackdump
+core
+core.*
+
+# IDE/editor files
+.idea/
+.vscode/
+*.iml
+*.suo
+*.user
+*.userossc
+*.sln.docstates
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Repo-specific large/generated outputs
+vcpkg_installed/
+bench_data_mt3/
+bench_opt_mt3/
+data/

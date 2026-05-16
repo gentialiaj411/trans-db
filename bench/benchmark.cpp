@@ -171,6 +171,8 @@ BenchResult Benchmark::Run() {
 void Benchmark::WorkerThread(uint32_t thread_id) {
   std::mt19937_64 rng(static_cast<uint64_t>(std::random_device{}()) + thread_id * 1315423911ULL);
   std::uniform_int_distribution<int> mix_dist(1, 100);
+  std::uniform_int_distribution<int> jitter_us(50, 300);
+  uint32_t consecutive_aborts = 0;
 
   while (running_.load(std::memory_order_relaxed)) {
     const bool run_new_order = mix_dist(rng) <= 60;
@@ -179,6 +181,7 @@ void Benchmark::WorkerThread(uint32_t thread_id) {
     const auto end = std::chrono::high_resolution_clock::now();
 
     if (ok) {
+      consecutive_aborts = 0;
       committed_.fetch_add(1, std::memory_order_relaxed);
       if (run_new_order) {
         new_order_count_.fetch_add(1, std::memory_order_relaxed);
@@ -193,6 +196,10 @@ void Benchmark::WorkerThread(uint32_t thread_id) {
       }
     } else {
       aborted_.fetch_add(1, std::memory_order_relaxed);
+      consecutive_aborts = std::min<uint32_t>(consecutive_aborts + 1, 8);
+      const int base = 1 << consecutive_aborts;
+      const int sleep_us = base * jitter_us(rng);
+      std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
     }
   }
 }
@@ -284,22 +291,6 @@ bool Benchmark::RunPayment(uint32_t thread_id) {
 
   const uint64_t txn = coordinator_->Begin();
 
-  std::string warehouse_row;
-  if (!coordinator_->Read(txn, warehouse_tid_, warehouse_pk, &warehouse_row).ok()) {
-    (void)coordinator_->Abort(txn);
-    return false;
-  }
-  auto wcols = DecodeRow(warehouse_row);
-  if (wcols.size() != 3) {
-    (void)coordinator_->Abort(txn);
-    return false;
-  }
-  wcols[2] = std::to_string(ParseDouble(wcols[2]) + amount);
-  if (!coordinator_->Write(txn, warehouse_tid_, warehouse_pk, EncodeRow(wcols)).ok()) {
-    (void)coordinator_->Abort(txn);
-    return false;
-  }
-
   std::string district_row;
   if (!coordinator_->Read(txn, district_tid_, district_pk, &district_row).ok()) {
     (void)coordinator_->Abort(txn);
@@ -312,6 +303,22 @@ bool Benchmark::RunPayment(uint32_t thread_id) {
   }
   dcols[4] = std::to_string(ParseDouble(dcols[4]) + amount);
   if (!coordinator_->Write(txn, district_tid_, district_pk, EncodeRow(dcols)).ok()) {
+    (void)coordinator_->Abort(txn);
+    return false;
+  }
+
+  std::string warehouse_row;
+  if (!coordinator_->Read(txn, warehouse_tid_, warehouse_pk, &warehouse_row).ok()) {
+    (void)coordinator_->Abort(txn);
+    return false;
+  }
+  auto wcols = DecodeRow(warehouse_row);
+  if (wcols.size() != 3) {
+    (void)coordinator_->Abort(txn);
+    return false;
+  }
+  wcols[2] = std::to_string(ParseDouble(wcols[2]) + amount);
+  if (!coordinator_->Write(txn, warehouse_tid_, warehouse_pk, EncodeRow(wcols)).ok()) {
     (void)coordinator_->Abort(txn);
     return false;
   }

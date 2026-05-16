@@ -91,27 +91,30 @@ uint64_t Coordinator::Begin() {
   std::scoped_lock lk(mu_);
   const uint64_t raft_txn_id = next_txn_id_++;
   const uint64_t snap = ts_oracle_.Now();
-  CoordinatorTxn txn;
-  txn.raft_txn_id = raft_txn_id;
-  txn.snapshot_ts = snap;
-  txn.aborted = false;
+  auto txn = std::make_shared<CoordinatorTxn>();
+  txn->raft_txn_id = raft_txn_id;
+  txn->snapshot_ts = snap;
+  txn->aborted = false;
   txns_[raft_txn_id] = std::move(txn);
   return raft_txn_id;
 }
 
 Status Coordinator::Read(uint64_t txn_id, uint32_t table_id, std::string_view key,
                          std::string* value) {
-  std::scoped_lock lk(mu_);
-  auto tit = txns_.find(txn_id);
-  if (tit == txns_.end()) {
-    return Status::Error(StatusCode::InvalidArgument, "unknown txn");
+  std::shared_ptr<CoordinatorTxn> txn;
+  {
+    std::scoped_lock lk(mu_);
+    auto tit = txns_.find(txn_id);
+    if (tit == txns_.end()) {
+      return Status::Error(StatusCode::InvalidArgument, "unknown txn");
+    }
+    txn = tit->second;
   }
-  CoordinatorTxn& txn = tit->second;
-  if (txn.aborted) {
+  if (txn->aborted) {
     return Status::Error(StatusCode::InvalidArgument, "txn aborted");
   }
   const uint32_t shard_id = RouteShard(key);
-  Status es = EnsureShardParticipant(txn, shard_id);
+  Status es = EnsureShardParticipant(*txn, shard_id);
   if (!es.ok()) {
     return es;
   }
@@ -120,7 +123,7 @@ Status Coordinator::Read(uint64_t txn_id, uint32_t table_id, std::string_view ke
   grpc::ClientContext ctx;
   ApplyDeadline(&ctx);
   ExecuteRequest req;
-  req.set_raft_txn_id(txn.raft_txn_id);
+  req.set_raft_txn_id(txn->raft_txn_id);
   req.set_op(OP_READ);
   req.set_table_id(table_id);
   req.set_key(key.data(), key.size());
@@ -131,17 +134,20 @@ Status Coordinator::Read(uint64_t txn_id, uint32_t table_id, std::string_view ke
 
 Status Coordinator::Write(uint64_t txn_id, uint32_t table_id, std::string_view key,
                           std::string_view value) {
-  std::scoped_lock lk(mu_);
-  auto tit = txns_.find(txn_id);
-  if (tit == txns_.end()) {
-    return Status::Error(StatusCode::InvalidArgument, "unknown txn");
+  std::shared_ptr<CoordinatorTxn> txn;
+  {
+    std::scoped_lock lk(mu_);
+    auto tit = txns_.find(txn_id);
+    if (tit == txns_.end()) {
+      return Status::Error(StatusCode::InvalidArgument, "unknown txn");
+    }
+    txn = tit->second;
   }
-  CoordinatorTxn& txn = tit->second;
-  if (txn.aborted) {
+  if (txn->aborted) {
     return Status::Error(StatusCode::InvalidArgument, "txn aborted");
   }
   const uint32_t shard_id = RouteShard(key);
-  Status es = EnsureShardParticipant(txn, shard_id);
+  Status es = EnsureShardParticipant(*txn, shard_id);
   if (!es.ok()) {
     return es;
   }
@@ -150,7 +156,7 @@ Status Coordinator::Write(uint64_t txn_id, uint32_t table_id, std::string_view k
   grpc::ClientContext ctx;
   ApplyDeadline(&ctx);
   ExecuteRequest req;
-  req.set_raft_txn_id(txn.raft_txn_id);
+  req.set_raft_txn_id(txn->raft_txn_id);
   req.set_op(OP_WRITE);
   req.set_table_id(table_id);
   req.set_key(key.data(), key.size());
@@ -161,17 +167,20 @@ Status Coordinator::Write(uint64_t txn_id, uint32_t table_id, std::string_view k
 }
 
 Status Coordinator::Delete(uint64_t txn_id, uint32_t table_id, std::string_view key) {
-  std::scoped_lock lk(mu_);
-  auto tit = txns_.find(txn_id);
-  if (tit == txns_.end()) {
-    return Status::Error(StatusCode::InvalidArgument, "unknown txn");
+  std::shared_ptr<CoordinatorTxn> txn;
+  {
+    std::scoped_lock lk(mu_);
+    auto tit = txns_.find(txn_id);
+    if (tit == txns_.end()) {
+      return Status::Error(StatusCode::InvalidArgument, "unknown txn");
+    }
+    txn = tit->second;
   }
-  CoordinatorTxn& txn = tit->second;
-  if (txn.aborted) {
+  if (txn->aborted) {
     return Status::Error(StatusCode::InvalidArgument, "txn aborted");
   }
   const uint32_t shard_id = RouteShard(key);
-  Status es = EnsureShardParticipant(txn, shard_id);
+  Status es = EnsureShardParticipant(*txn, shard_id);
   if (!es.ok()) {
     return es;
   }
@@ -180,7 +189,7 @@ Status Coordinator::Delete(uint64_t txn_id, uint32_t table_id, std::string_view 
   grpc::ClientContext ctx;
   ApplyDeadline(&ctx);
   ExecuteRequest req;
-  req.set_raft_txn_id(txn.raft_txn_id);
+  req.set_raft_txn_id(txn->raft_txn_id);
   req.set_op(OP_DELETE);
   req.set_table_id(table_id);
   req.set_key(key.data(), key.size());
@@ -194,49 +203,72 @@ Status Coordinator::Scan(uint64_t txn_id, uint32_t table_id, std::string_view ra
                          std::vector<std::pair<std::string, std::string>>* rows_out) {
   rows_out->clear();
 
-  std::scoped_lock lk(mu_);
-  auto tit = txns_.find(txn_id);
-  if (tit == txns_.end()) {
-    return Status::Error(StatusCode::InvalidArgument, "unknown txn");
+  std::shared_ptr<CoordinatorTxn> txn;
+  {
+    std::scoped_lock lk(mu_);
+    auto tit = txns_.find(txn_id);
+    if (tit == txns_.end()) {
+      return Status::Error(StatusCode::InvalidArgument, "unknown txn");
+    }
+    txn = tit->second;
   }
-  CoordinatorTxn& txn = tit->second;
-  if (txn.aborted) {
+  if (txn->aborted) {
     return Status::Error(StatusCode::InvalidArgument, "txn aborted");
   }
 
   for (uint32_t sid = 0; sid < num_shards_; ++sid) {
-    Status es = EnsureShardParticipant(txn, sid);
+    Status es = EnsureShardParticipant(*txn, sid);
     if (!es.ok()) {
       return es;
     }
   }
 
 
+  std::vector<std::future<std::pair<Status, std::vector<std::pair<std::string, std::string>>>>>
+      scan_futs;
+  scan_futs.reserve(num_shards_);
   for (uint32_t sid = 0; sid < num_shards_; ++sid) {
-    ShardService::Stub* stub = GetStub(sid);
-    if (!stub) {
-      return Status::Error(StatusCode::InvalidArgument, "unknown shard id");
+    scan_futs.push_back(std::async(std::launch::async, [=, this]() {
+      std::vector<std::pair<std::string, std::string>> shard_rows;
+      ShardService::Stub* stub = GetStub(sid);
+      if (!stub) {
+        return std::make_pair(Status::Error(StatusCode::InvalidArgument, "unknown shard id"),
+                              std::move(shard_rows));
+      }
+      grpc::ClientContext ctx;
+      ApplyDeadline(&ctx);
+      ExecuteRequest req;
+      req.set_raft_txn_id(txn->raft_txn_id);
+      req.set_op(OP_SCAN);
+      req.set_table_id(table_id);
+      req.set_range_start_pk(range_start_pk.data(), range_start_pk.size());
+      req.set_range_end_exclusive(range_end_exclusive.data(), range_end_exclusive.size());
+      req.set_range_end_open(range_end_open);
+      ExecuteResponse resp;
+      const bool grpc_ok = stub->Execute(&ctx, req, &resp).ok();
+      if (!grpc_ok) {
+        return std::make_pair(Status::IOError("gRPC Execute failed"), std::move(shard_rows));
+      }
+      if (!resp.ok()) {
+        return std::make_pair(
+            Status::Error(static_cast<StatusCode>(resp.error_code()), resp.error_message()),
+            std::move(shard_rows));
+      }
+      shard_rows.reserve(static_cast<size_t>(resp.scan_rows_size()));
+      for (const ScanRow& row : resp.scan_rows()) {
+        shard_rows.emplace_back(row.pk(), row.row_value());
+      }
+      return std::make_pair(Status::OK(), std::move(shard_rows));
+    }));
+  }
+
+  for (auto& fut : scan_futs) {
+    auto [st, shard_rows] = fut.get();
+    if (!st.ok()) {
+      return st;
     }
-    grpc::ClientContext ctx;
-    ApplyDeadline(&ctx);
-    ExecuteRequest req;
-    req.set_raft_txn_id(txn.raft_txn_id);
-    req.set_op(OP_SCAN);
-    req.set_table_id(table_id);
-    req.set_range_start_pk(range_start_pk.data(), range_start_pk.size());
-    req.set_range_end_exclusive(range_end_exclusive.data(), range_end_exclusive.size());
-    req.set_range_end_open(range_end_open);
-    ExecuteResponse resp;
-    const bool grpc_ok = stub->Execute(&ctx, req, &resp).ok();
-    if (!grpc_ok) {
-      return Status::IOError("gRPC Execute failed");
-    }
-    if (!resp.ok()) {
-      return Status::Error(static_cast<StatusCode>(resp.error_code()), resp.error_message());
-    }
-    for (const ScanRow& row : resp.scan_rows()) {
-      rows_out->emplace_back(row.pk(), row.row_value());
-    }
+    rows_out->insert(rows_out->end(), std::make_move_iterator(shard_rows.begin()),
+                     std::make_move_iterator(shard_rows.end()));
   }
 
   std::sort(rows_out->begin(), rows_out->end(),
@@ -360,22 +392,27 @@ Status Coordinator::TwoPhaseCommit(uint64_t raft_txn_id, std::vector<uint32_t> p
 }
 
 Status Coordinator::Commit(uint64_t txn_id) {
-  std::scoped_lock lk(mu_);
-  auto tit = txns_.find(txn_id);
-  if (tit == txns_.end()) {
-    return Status::Error(StatusCode::InvalidArgument, "unknown txn");
+  std::shared_ptr<CoordinatorTxn> txn;
+  {
+    std::scoped_lock lk(mu_);
+    auto tit = txns_.find(txn_id);
+    if (tit == txns_.end()) {
+      return Status::Error(StatusCode::InvalidArgument, "unknown txn");
+    }
+    txn = tit->second;
   }
-  CoordinatorTxn& txn = tit->second;
-  if (txn.aborted) {
-    txns_.erase(tit);
+  if (txn->aborted) {
+    std::scoped_lock lk(mu_);
+    txns_.erase(txn_id);
     return Status::Error(StatusCode::InvalidArgument, "txn aborted");
   }
-  if (txn.participant_shards.empty()) {
-    txns_.erase(tit);
+  if (txn->participant_shards.empty()) {
+    std::scoped_lock lk(mu_);
+    txns_.erase(txn_id);
     return Status::OK();
   }
-  std::vector<uint32_t> parts(txn.participant_shards.begin(), txn.participant_shards.end());
-  const uint64_t raft_txn_id = txn.raft_txn_id;
+  std::vector<uint32_t> parts(txn->participant_shards.begin(), txn->participant_shards.end());
+  const uint64_t raft_txn_id = txn->raft_txn_id;
   const uint64_t commit_ts = ts_oracle_.Now();
 
   Status out;
@@ -384,7 +421,10 @@ Status Coordinator::Commit(uint64_t txn_id) {
   } else {
     out = TwoPhaseCommit(raft_txn_id, std::move(parts), commit_ts);
   }
-  txns_.erase(txn_id);
+  {
+    std::scoped_lock lk(mu_);
+    txns_.erase(txn_id);
+  }
   return out;
 }
 
@@ -397,8 +437,8 @@ Status Coordinator::Abort(uint64_t txn_id) {
     if (tit == txns_.end()) {
       return Status::OK();
     }
-    raft_tid = tit->second.raft_txn_id;
-    parts.assign(tit->second.participant_shards.begin(), tit->second.participant_shards.end());
+    raft_tid = tit->second->raft_txn_id;
+    parts.assign(tit->second->participant_shards.begin(), tit->second->participant_shards.end());
     txns_.erase(tit);
   }
 

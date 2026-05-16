@@ -297,13 +297,20 @@ void RaftNode::Stop() {
 }
 
 uint64_t RaftNode::Propose(RaftEntryType type, std::string payload) {
-  std::scoped_lock lk(mu_);
-  if (role_ != RaftRole::LEADER) {
+  uint64_t idx = 0;
+  {
+    std::scoped_lock lk(mu_);
+    if (role_ != RaftRole::LEADER) {
+      return 0;
+    }
+    idx = log_.Append(current_term_, type, std::move(payload));
+    immediate_replicate_ = true;
+    cv_.notify_all();
+  }
+  std::thread([this]() { this->SendAppendEntriesToAll(); }).detach();
+  if (idx == 0) {
     return 0;
   }
-  const uint64_t idx = log_.Append(current_term_, type, std::move(payload));
-  immediate_replicate_ = true;
-  cv_.notify_all();
   return idx;
 }
 
