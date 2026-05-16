@@ -1,17 +1,31 @@
 #include "raft/raft_node.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 
 namespace txndb {
 
 RaftNode::RaftNode(uint32_t node_id, std::vector<uint32_t> peer_ids, RaftTransport* transport,
                    ApplyCallback apply_cb)
+    : RaftNode(node_id, std::move(peer_ids), transport, std::move(apply_cb), "") {}
+
+RaftNode::RaftNode(uint32_t node_id, std::vector<uint32_t> peer_ids, RaftTransport* transport,
+                   ApplyCallback apply_cb, std::string raft_dir)
     : node_id_(node_id),
       peer_ids_(std::move(peer_ids)),
       transport_(transport),
       apply_cb_(std::move(apply_cb)),
+      raft_dir_(std::move(raft_dir)),
+      meta_path_(raft_dir_.empty() ? "" : (raft_dir_ + "/raft_meta")),
+      log_(raft_dir_.empty() ? std::string() : (raft_dir_ + "/raft_log")),
       rng_(std::random_device{}()) {
+  if (!raft_dir_.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(raft_dir_, ec);
+    LoadMeta();
+  }
   last_heartbeat_recv_ = std::chrono::steady_clock::now();
   last_broadcast_ = last_heartbeat_recv_;
   RandomizeElectionTimeoutLocked();
@@ -33,6 +47,7 @@ void RaftNode::RandomizeElectionTimeoutLocked() {
 void RaftNode::BecomeFollower(uint64_t term) {
   current_term_ = term;
   voted_for_.reset();
+  PersistMeta();
   role_ = RaftRole::FOLLOWER;
   leader_id_ = UINT32_MAX;
   RandomizeElectionTimeoutLocked();
@@ -43,6 +58,7 @@ void RaftNode::BecomeCandidateLocked() {
   role_ = RaftRole::CANDIDATE;
   current_term_++;
   voted_for_ = node_id_;
+  PersistMeta();
   leader_id_ = UINT32_MAX;
   last_heartbeat_recv_ = std::chrono::steady_clock::now();
   RandomizeElectionTimeoutLocked();
@@ -378,6 +394,7 @@ RequestVoteResponse RaftNode::HandleRequestVote(const RequestVoteRequest& req) {
   bool grant = (!voted_for_.has_value() || *voted_for_ == req.candidate_id) && up_to_date;
   if (grant) {
     voted_for_ = req.candidate_id;
+    PersistMeta();
     resp.vote_granted = true;
   }
   resp.term = current_term_;
@@ -414,6 +431,69 @@ const RaftLog& RaftNode::GetLog() const { return log_; }
 bool RaftNode::WaitForCommit(uint64_t index, std::chrono::milliseconds timeout) {
   std::unique_lock lk(mu_);
   return cv_.wait_for(lk, timeout, [this, index] { return last_applied_ >= index; });
+}
+
+void RaftNode::LoadMeta() {
+  if (meta_path_.empty()) {
+    return;
+  }
+  std::ifstream in(meta_path_, std::ios::binary);
+  if (!in) {
+    return;
+  }
+  char buf[13];
+  in.read(buf, sizeof(buf));
+  if (in.gcount() != static_cast<std::streamsize>(sizeof(buf))) {
+    return;
+  }
+  uint64_t term = 0;
+  for (int i = 0; i < 8; ++i) {
+    term |= static_cast<uint64_t>(static_cast<unsigned char>(buf[i])) << (8 * i);
+  }
+  const bool has_vote = buf[8] != 0;
+  uint32_t voted_for = 0;
+  for (int i = 0; i < 4; ++i) {
+    voted_for |= static_cast<uint32_t>(static_cast<unsigned char>(buf[9 + i])) << (8 * i);
+  }
+  current_term_ = term;
+  voted_for_ = has_vote ? std::optional<uint32_t>(voted_for) : std::nullopt;
+}
+
+void RaftNode::PersistMeta() const {
+  if (meta_path_.empty()) {
+    return;
+  }
+  const std::string tmp = meta_path_ + ".tmp";
+  std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    return;
+  }
+  char buf[13]{};
+  uint64_t term = current_term_;
+  for (int i = 0; i < 8; ++i) {
+    buf[i] = static_cast<char>((term >> (8 * i)) & 0xffu);
+  }
+  buf[8] = voted_for_.has_value() ? 1 : 0;
+  const uint32_t vf = voted_for_.value_or(0);
+  for (int i = 0; i < 4; ++i) {
+    buf[9 + i] = static_cast<char>((vf >> (8 * i)) & 0xffu);
+  }
+  out.write(buf, sizeof(buf));
+  out.flush();
+  out.close();
+  if (!out) {
+    return;
+  }
+  std::error_code ec;
+  std::filesystem::rename(tmp, meta_path_, ec);
+  if (ec) {
+    std::filesystem::remove(meta_path_, ec);
+    ec.clear();
+    std::filesystem::rename(tmp, meta_path_, ec);
+    if (ec) {
+      std::filesystem::remove(tmp, ec);
+    }
+  }
 }
 
 }  // namespace txndb

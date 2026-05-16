@@ -29,6 +29,7 @@ struct RaftLogEntry {
 class RaftLog {
 public:
   RaftLog() = default;
+  explicit RaftLog(std::string path);
 
   uint64_t Append(uint64_t term, RaftEntryType type, std::string payload);
 
@@ -45,8 +46,13 @@ public:
   void AppendEntries(const std::vector<RaftLogEntry>& entries);
 
 private:
+  void Load();
+  bool AppendEntryToFile(const RaftLogEntry& entry);
+  bool RewriteFileFromMemory() const;
+
   mutable std::mutex mu_;
   std::vector<RaftLogEntry> entries_;
+  std::string path_;
 };
 
 }  // namespace txndb

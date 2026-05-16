@@ -499,3 +499,134 @@ TEST(RaftCluster, FullTransactionViaRaft) {
     EXPECT_EQ(ts, cts);
   }
 }
+
+TEST(RaftPersistence, LogSurvivesRestart) {
+  const std::string dir = UniquePath("raft_log_persist");
+  Nuke(dir);
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  const std::string log_path = (fs::path(dir) / "raft_log").string();
+  {
+    RaftLog log(log_path);
+    for (uint64_t i = 0; i < 5; ++i) {
+      const uint64_t idx = log.Append(3, RaftEntryType::TXN_BEGIN, "p" + std::to_string(i));
+      ASSERT_EQ(idx, i + 1);
+    }
+    ASSERT_EQ(log.LastIndex(), 5u);
+  }
+  {
+    RaftLog reloaded(log_path);
+    ASSERT_EQ(reloaded.LastIndex(), 5u);
+    for (uint64_t i = 1; i <= 5; ++i) {
+      auto e = reloaded.Get(i);
+      ASSERT_TRUE(e.has_value());
+      EXPECT_EQ(e->index, i);
+      EXPECT_EQ(e->term, 3u);
+      EXPECT_EQ(e->type, RaftEntryType::TXN_BEGIN);
+      EXPECT_EQ(e->payload, "p" + std::to_string(i - 1));
+    }
+  }
+  Nuke(dir);
+}
+
+TEST(RaftPersistence, MetaSurvivesRestart) {
+  const std::string dir = UniquePath("raft_meta_term");
+  Nuke(dir);
+  InProcessTransport t;
+  {
+    RaftNode node(1, {2, 3}, &t, nullptr, dir);
+    RequestVoteRequest req;
+    req.term = 9;
+    req.candidate_id = 2;
+    req.last_log_index = 0;
+    req.last_log_term = 0;
+    auto resp = node.HandleRequestVote(req);
+    ASSERT_TRUE(resp.vote_granted);
+    ASSERT_EQ(node.GetCurrentTerm(), 9u);
+  }
+  {
+    RaftNode node(1, {2, 3}, &t, nullptr, dir);
+    EXPECT_EQ(node.GetCurrentTerm(), 9u);
+  }
+  Nuke(dir);
+}
+
+TEST(RaftPersistence, VotedForSurvivesRestart) {
+  const std::string dir = UniquePath("raft_meta_vote");
+  Nuke(dir);
+  InProcessTransport t;
+  {
+    RaftNode node(1, {2, 3}, &t, nullptr, dir);
+    RequestVoteRequest req;
+    req.term = 11;
+    req.candidate_id = 2;
+    req.last_log_index = 0;
+    req.last_log_term = 0;
+    auto resp = node.HandleRequestVote(req);
+    ASSERT_TRUE(resp.vote_granted);
+  }
+  {
+    RaftNode node(1, {2, 3}, &t, nullptr, dir);
+    EXPECT_EQ(node.GetCurrentTerm(), 11u);
+    RequestVoteRequest req2;
+    req2.term = 11;
+    req2.candidate_id = 3;
+    req2.last_log_index = 0;
+    req2.last_log_term = 0;
+    auto resp2 = node.HandleRequestVote(req2);
+    EXPECT_FALSE(resp2.vote_granted);
+    EXPECT_EQ(resp2.term, 11u);
+  }
+  Nuke(dir);
+}
+
+TEST(RaftPersistence, TruncateFromSurvivesRestart) {
+  const std::string dir = UniquePath("raft_log_truncate_restart");
+  Nuke(dir);
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  const std::string log_path = (fs::path(dir) / "raft_log").string();
+  {
+    RaftLog log(log_path);
+    for (uint64_t i = 0; i < 5; ++i) {
+      const uint64_t idx = log.Append(1, RaftEntryType::TXN_BEGIN, "p" + std::to_string(i));
+      ASSERT_EQ(idx, i + 1);
+    }
+    log.TruncateFrom(3);
+  }
+  {
+    RaftLog reloaded(log_path);
+    ASSERT_EQ(reloaded.LastIndex(), 2u);
+    EXPECT_FALSE(reloaded.Get(3).has_value());
+  }
+  Nuke(dir);
+}
+
+TEST(RaftPersistence, ConflictTruncationSurvivesRestart) {
+  const std::string dir = UniquePath("raft_log_conflict_restart");
+  Nuke(dir);
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  const std::string log_path = (fs::path(dir) / "raft_log").string();
+  {
+    RaftLog log(log_path);
+    ASSERT_EQ(log.Append(1, RaftEntryType::TXN_BEGIN, "a"), 1u);
+    ASSERT_EQ(log.Append(1, RaftEntryType::TXN_BEGIN, "b"), 2u);
+    ASSERT_EQ(log.Append(1, RaftEntryType::TXN_BEGIN, "c1"), 3u);
+
+    std::vector<RaftLogEntry> incoming;
+    incoming.push_back(RaftLogEntry{3, 2, RaftEntryType::TXN_BEGIN, "c2"});
+    incoming.push_back(RaftLogEntry{4, 2, RaftEntryType::TXN_BEGIN, "d"});
+    log.AppendEntries(incoming);
+  }
+  {
+    RaftLog reloaded(log_path);
+    ASSERT_EQ(reloaded.LastIndex(), 4u);
+    ASSERT_EQ(reloaded.TermAt(3), 2u);
+    auto e3 = reloaded.Get(3);
+    ASSERT_TRUE(e3.has_value());
+    ASSERT_EQ(e3->payload, "c2");
+    ASSERT_EQ(e3->term, 2u);
+  }
+  Nuke(dir);
+}

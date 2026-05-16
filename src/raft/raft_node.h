@@ -62,6 +62,8 @@ class RaftNode {
 public:
   RaftNode(uint32_t node_id, std::vector<uint32_t> peer_ids, RaftTransport* transport,
            ApplyCallback apply_cb);
+  RaftNode(uint32_t node_id, std::vector<uint32_t> peer_ids, RaftTransport* transport,
+           ApplyCallback apply_cb, std::string raft_dir);
 
   ~RaftNode();
 
@@ -101,9 +103,13 @@ private:
   void ApplyCommitted();
   void RandomizeElectionTimeoutLocked();
   int MajorityThreshold() const;
+  void LoadMeta();
+  void PersistMeta() const;
 
   uint64_t current_term_{0};
   std::optional<uint32_t> voted_for_;
+  std::string raft_dir_;
+  std::string meta_path_;
   RaftLog log_;
 
   RaftRole role_{RaftRole::FOLLOWER};
