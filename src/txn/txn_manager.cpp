@@ -37,6 +37,32 @@ Transaction* TxnManager::GetTxn(uint64_t txn_id) {
   return it->second.get();
 }
 
+uint64_t TxnManager::ImportPreparedTxn(uint64_t snapshot_ts, uint64_t commit_ts,
+                                       const std::vector<BufferedWrite>& writes) {
+  const uint64_t txn_id = next_txn_id_.fetch_add(1, std::memory_order_relaxed);
+  auto txn = std::make_unique<Transaction>();
+  txn->txn_id = txn_id;
+  txn->snapshot_ts = snapshot_ts;
+  txn->prepare_commit_ts = commit_ts;
+  txn->state = TxnState::PREPARED;
+  txn->write_set = writes;
+
+  wal_->Append(txn_id, WALRecordType::BEGIN, WAL::SerializeBeginPayload(snapshot_ts));
+  for (const auto& w : writes) {
+    if (w.is_delete) {
+      wal_->Append(txn_id, WALRecordType::DELETE, WAL::SerializeDeletePayload(w.table_id, w.key, 0));
+    } else {
+      wal_->Append(txn_id, WALRecordType::WRITE,
+                   WAL::SerializeWritePayload(w.table_id, w.key, w.value, 0));
+    }
+  }
+  (void)wal_->AppendSync(txn_id, WALRecordType::PREPARE, WAL::SerializePreparePayload(commit_ts));
+
+  std::scoped_lock lk(mu_);
+  txns_[txn_id] = std::move(txn);
+  return txn_id;
+}
+
 uint64_t TxnManager::Begin(uint64_t snapshot_ts) {
   const uint64_t txn_id = next_txn_id_.fetch_add(1, std::memory_order_relaxed);
   auto txn = std::make_unique<Transaction>();

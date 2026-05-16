@@ -13,7 +13,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace txndb {
@@ -29,6 +31,13 @@ struct ReplicaStack {
 
 class ShardServiceImpl final : public ShardService::Service {
 public:
+  struct PendingTxn {
+    uint64_t raft_txn_id{0};
+    uint64_t snapshot_ts{0};
+    uint64_t local_txn_id{0};
+    bool prepared_replicated{false};
+  };
+
   ShardServiceImpl(uint32_t shard_id, const std::string& data_dir, uint32_t num_replicas = 3);
   ~ShardServiceImpl();
 
@@ -63,6 +72,8 @@ private:
 
   InProcessTransport transport_;
   std::vector<std::unique_ptr<ReplicaStack>> replicas_;
+  std::mutex pending_mu_;
+  std::unordered_map<uint64_t, PendingTxn> pending_txns_;
 };
 
 class ShardServer {

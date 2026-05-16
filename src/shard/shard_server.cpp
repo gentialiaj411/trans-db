@@ -25,7 +25,8 @@ uint32_t ErrorCode(StatusCode c) { return static_cast<uint32_t>(c); }
 
 }  // namespace
 
-ShardServiceImpl::ShardServiceImpl(uint32_t shard_id, const std::string& data_dir, uint32_t num_replicas)
+ShardServiceImpl::ShardServiceImpl(uint32_t shard_id, const std::string& data_dir,
+                                   uint32_t num_replicas)
     : shard_id_(shard_id), data_dir_(data_dir) {
   std::error_code ec;
   fs::create_directories(data_dir_, ec);
@@ -70,9 +71,7 @@ ShardServiceImpl::ShardServiceImpl(uint32_t shard_id, const std::string& data_di
   }
 }
 
-ShardServiceImpl::~ShardServiceImpl() {
-  Stop();
-}
+ShardServiceImpl::~ShardServiceImpl() { Stop(); }
 
 void ShardServiceImpl::Start() {
   if (started_) {
@@ -148,21 +147,31 @@ grpc::Status ShardServiceImpl::Execute(grpc::ServerContext* /*context*/, const E
     return grpc::Status::OK;
   }
 
+  const uint64_t raft_txn_id = request->raft_txn_id();
   switch (static_cast<int>(request->op())) {
     case 0: /* OP_BEGIN */ {
-      const std::string payload = RaftStateMachine::PackTxnPayload(
-          WAL::SerializeBeginPayload(request->snapshot_ts()), request->raft_txn_id());
-      if (!ProposeAndWait(RaftEntryType::TXN_BEGIN, std::move(payload))) {
-        response->set_ok(false);
-        response->set_error_code(ErrorCode(StatusCode::IOError));
-        response->set_error_message("TXN_BEGIN not committed");
-        return grpc::Status::OK;
+      const uint64_t local = L->txn_mgr->Begin(request->snapshot_ts());
+      L->state_machine->RegisterLocalTxn(raft_txn_id, local);
+      {
+        std::scoped_lock lk(pending_mu_);
+        pending_txns_[raft_txn_id] =
+            PendingTxn{raft_txn_id, request->snapshot_ts(), local, false};
       }
       response->set_ok(true);
       return grpc::Status::OK;
     }
     case 1: /* OP_READ */ {
-      const uint64_t local = L->state_machine->GetLocalTxnId(request->raft_txn_id());
+      uint64_t local = 0;
+      {
+        std::scoped_lock lk(pending_mu_);
+        auto it = pending_txns_.find(raft_txn_id);
+        if (it != pending_txns_.end()) {
+          local = it->second.local_txn_id;
+        }
+      }
+      if (local == 0) {
+        local = L->state_machine->GetLocalTxnId(raft_txn_id);
+      }
       if (local == 0) {
         response->set_ok(false);
         response->set_error_code(ErrorCode(StatusCode::InvalidArgument));
@@ -182,34 +191,68 @@ grpc::Status ShardServiceImpl::Execute(grpc::ServerContext* /*context*/, const E
       return grpc::Status::OK;
     }
     case 2: /* OP_WRITE */ {
-      const std::string payload =
-          RaftStateMachine::PackTxnPayload(WAL::SerializeWritePayload(request->table_id(), request->key(),
-                                                                      request->value(), 0),
-                                           request->raft_txn_id());
-      if (!ProposeAndWait(RaftEntryType::TXN_WRITE, std::move(payload))) {
+      uint64_t local = 0;
+      {
+        std::scoped_lock lk(pending_mu_);
+        auto it = pending_txns_.find(raft_txn_id);
+        if (it != pending_txns_.end()) {
+          local = it->second.local_txn_id;
+        }
+      }
+      if (local == 0) {
         response->set_ok(false);
-        response->set_error_code(ErrorCode(StatusCode::IOError));
-        response->set_error_message("TXN_WRITE not committed");
+        response->set_error_code(ErrorCode(StatusCode::InvalidArgument));
+        response->set_error_message("txn not begun on shard");
+        return grpc::Status::OK;
+      }
+      const Status ws =
+          L->txn_mgr->Write(local, request->table_id(), request->key(), request->value());
+      if (!ws.ok()) {
+        response->set_ok(false);
+        response->set_error_code(ErrorCode(ws.code()));
+        response->set_error_message(ws.message());
         return grpc::Status::OK;
       }
       response->set_ok(true);
       return grpc::Status::OK;
     }
     case 3: /* OP_DELETE */ {
-      const std::string payload = RaftStateMachine::PackTxnPayload(
-          WAL::SerializeDeletePayload(request->table_id(), request->key(), 0),
-          request->raft_txn_id());
-      if (!ProposeAndWait(RaftEntryType::TXN_DELETE, std::move(payload))) {
+      uint64_t local = 0;
+      {
+        std::scoped_lock lk(pending_mu_);
+        auto it = pending_txns_.find(raft_txn_id);
+        if (it != pending_txns_.end()) {
+          local = it->second.local_txn_id;
+        }
+      }
+      if (local == 0) {
         response->set_ok(false);
-        response->set_error_code(ErrorCode(StatusCode::IOError));
-        response->set_error_message("TXN_DELETE not committed");
+        response->set_error_code(ErrorCode(StatusCode::InvalidArgument));
+        response->set_error_message("txn not begun on shard");
+        return grpc::Status::OK;
+      }
+      const Status ds = L->txn_mgr->Delete(local, request->table_id(), request->key());
+      if (!ds.ok()) {
+        response->set_ok(false);
+        response->set_error_code(ErrorCode(ds.code()));
+        response->set_error_message(ds.message());
         return grpc::Status::OK;
       }
       response->set_ok(true);
       return grpc::Status::OK;
     }
     case 4: /* OP_SCAN */ {
-      const uint64_t local = L->state_machine->GetLocalTxnId(request->raft_txn_id());
+      uint64_t local = 0;
+      {
+        std::scoped_lock lk(pending_mu_);
+        auto it = pending_txns_.find(raft_txn_id);
+        if (it != pending_txns_.end()) {
+          local = it->second.local_txn_id;
+        }
+      }
+      if (local == 0) {
+        local = L->state_machine->GetLocalTxnId(raft_txn_id);
+      }
       if (local == 0) {
         response->set_ok(false);
         response->set_error_code(ErrorCode(StatusCode::InvalidArgument));
@@ -218,8 +261,8 @@ grpc::Status ShardServiceImpl::Execute(grpc::ServerContext* /*context*/, const E
       }
       std::vector<std::pair<std::string, std::string>> rows;
       const Status rs = L->txn_mgr->Scan(local, request->table_id(), request->range_start_pk(),
-                                         request->range_end_exclusive(),
-                                         request->range_end_open(), &rows);
+                                         request->range_end_exclusive(), request->range_end_open(),
+                                         &rows);
       if (!rs.ok()) {
         response->set_ok(false);
         response->set_error_code(ErrorCode(rs.code()));
@@ -250,21 +293,79 @@ grpc::Status ShardServiceImpl::Prepare(grpc::ServerContext* /*context*/, const P
     response->set_error_message("no leader");
     return grpc::Status::OK;
   }
-  const uint64_t tid = request->raft_txn_id();
-  auto payload = RaftStateMachine::PackTxnPayload(WAL::SerializePreparePayload(request->commit_ts()), tid);
-  if (!ProposeAndWait(RaftEntryType::TXN_PREPARE, std::move(payload))) {
+
+  PendingTxn p;
+  {
+    std::scoped_lock lk(pending_mu_);
+    auto it = pending_txns_.find(request->raft_txn_id());
+    if (it == pending_txns_.end()) {
+      response->set_vote_commit(false);
+      response->set_error_message("unknown txn");
+      return grpc::Status::OK;
+    }
+    p = it->second;
+  }
+
+  const Status local_prepare = L->txn_mgr->Prepare(p.local_txn_id, request->commit_ts());
+  if (!local_prepare.ok()) {
+    (void)L->txn_mgr->Abort(p.local_txn_id);
+    L->state_machine->ForgetTxn(request->raft_txn_id());
+    std::scoped_lock lk(pending_mu_);
+    pending_txns_.erase(request->raft_txn_id());
     response->set_vote_commit(false);
-    response->set_error_message("prepare not replicated");
+    response->set_error_message(local_prepare.message());
     return grpc::Status::OK;
   }
-  auto pr = L->state_machine->TakePrepareResult(tid);
-  if (!pr.has_value()) {
+
+  Transaction* txn = L->txn_mgr->GetTxn(p.local_txn_id);
+  if (!txn) {
+    L->state_machine->ForgetTxn(request->raft_txn_id());
+    std::scoped_lock lk(pending_mu_);
+    pending_txns_.erase(request->raft_txn_id());
     response->set_vote_commit(false);
-    response->set_error_message("missing prepare result");
+    response->set_error_message("prepared txn missing");
     return grpc::Status::OK;
   }
-  response->set_vote_commit(pr->success);
-  response->set_error_message(pr->error);
+
+  std::vector<RaftStateMachine::PrepareBatchWrite> writes;
+  writes.reserve(txn->write_set.size());
+  for (const auto& w : txn->write_set) {
+    RaftStateMachine::PrepareBatchWrite bw;
+    bw.is_delete = w.is_delete;
+    bw.table_id = w.table_id;
+    bw.key = w.key;
+    bw.value = w.value;
+    writes.push_back(std::move(bw));
+  }
+
+  const std::string payload = RaftStateMachine::PackPrepareBatchPayload(
+      request->raft_txn_id(), p.snapshot_ts, request->commit_ts(), writes);
+  if (!ProposeAndWait(RaftEntryType::TXN_PREPARE_BATCH, payload)) {
+    (void)L->txn_mgr->Abort(p.local_txn_id);
+    L->state_machine->ForgetTxn(request->raft_txn_id());
+    std::scoped_lock lk(pending_mu_);
+    pending_txns_.erase(request->raft_txn_id());
+    response->set_vote_commit(false);
+    response->set_error_message("prepare batch not replicated");
+    return grpc::Status::OK;
+  }
+
+  auto pr = L->state_machine->TakePrepareResult(request->raft_txn_id());
+  if (!pr.has_value() || !pr->success) {
+    response->set_vote_commit(false);
+    response->set_error_message(pr ? pr->error : "missing prepare result");
+    return grpc::Status::OK;
+  }
+
+  {
+    std::scoped_lock lk(pending_mu_);
+    auto it = pending_txns_.find(request->raft_txn_id());
+    if (it != pending_txns_.end()) {
+      it->second.prepared_replicated = true;
+    }
+  }
+  response->set_vote_commit(true);
+  response->set_error_message("");
   return grpc::Status::OK;
 }
 
@@ -278,7 +379,12 @@ grpc::Status ShardServiceImpl::Commit(grpc::ServerContext* /*context*/, const Co
   }
   auto payload = RaftStateMachine::PackTxnPayload(WAL::SerializeCommitPayload(request->commit_ts()),
                                                   request->raft_txn_id());
-  response->set_ok(ProposeAndWait(RaftEntryType::TXN_COMMIT, std::move(payload)));
+  const bool ok = ProposeAndWait(RaftEntryType::TXN_COMMIT, std::move(payload));
+  response->set_ok(ok);
+  if (ok) {
+    std::scoped_lock lk(pending_mu_);
+    pending_txns_.erase(request->raft_txn_id());
+  }
   return grpc::Status::OK;
 }
 
@@ -286,11 +392,37 @@ grpc::Status ShardServiceImpl::Abort(grpc::ServerContext* /*context*/, const Abo
                                      AbortResponse* response) {
   ReplicaStack* L = FindLeader();
   if (!L) {
-    response->set_ok(true);  // idempotent teardown
+    response->set_ok(true);
     return grpc::Status::OK;
   }
+
+  PendingTxn p;
+  bool has_pending = false;
+  {
+    std::scoped_lock lk(pending_mu_);
+    auto it = pending_txns_.find(request->raft_txn_id());
+    if (it != pending_txns_.end()) {
+      has_pending = true;
+      p = it->second;
+    }
+  }
+
+  if (has_pending && !p.prepared_replicated) {
+    (void)L->txn_mgr->Abort(p.local_txn_id);
+    L->state_machine->ForgetTxn(request->raft_txn_id());
+    std::scoped_lock lk(pending_mu_);
+    pending_txns_.erase(request->raft_txn_id());
+    response->set_ok(true);
+    return grpc::Status::OK;
+  }
+
   const auto payload = RaftStateMachine::PackAbortPayload(request->raft_txn_id());
-  response->set_ok(ProposeAndWait(RaftEntryType::TXN_ABORT, std::string(payload)));
+  const bool ok = ProposeAndWait(RaftEntryType::TXN_ABORT, std::string(payload));
+  if (ok) {
+    std::scoped_lock lk(pending_mu_);
+    pending_txns_.erase(request->raft_txn_id());
+  }
+  response->set_ok(ok);
   return grpc::Status::OK;
 }
 
@@ -298,9 +430,7 @@ ShardServer::ShardServer(uint32_t shard_id, const std::string& data_dir,
                          const std::string& listen_addr)
     : service_(shard_id, data_dir), listen_addr_(listen_addr) {}
 
-ShardServer::~ShardServer() {
-  Stop();
-}
+ShardServer::~ShardServer() { Stop(); }
 
 void ShardServer::Start() {
   service_.Start();

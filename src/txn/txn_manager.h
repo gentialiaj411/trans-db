@@ -44,6 +44,8 @@ public:
   Status Recover();
 
   Transaction* GetTxn(uint64_t txn_id);
+  uint64_t ImportPreparedTxn(uint64_t snapshot_ts, uint64_t commit_ts,
+                             const std::vector<BufferedWrite>& writes);
 
 private:
   Status ValidateReadSet(const Transaction& txn, uint64_t commit_ts);

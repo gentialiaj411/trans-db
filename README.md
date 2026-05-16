@@ -73,23 +73,43 @@ psql -h localhost -p 5432
 ```
 
 ## TPC-C Benchmark (Simplified)
-Run:
+Run (multi-thread):
 ```bash
-./build/Release/bench_tpcc --shards 3 --threads 1 --duration 10 --warmup 0 --warehouses 1 --customers 20
+./build/Release/bench_tpcc --shards 3 --threads 4 --duration 30 --warmup 5 --warehouses 2
+```
+
+Run (single-thread baseline):
+```bash
+./build/Release/bench_tpcc --shards 3 --threads 1 --duration 30 --warmup 5 --warehouses 2
 ```
 
 Benchmarked on **Intel Core Ultra 9 275HX**, Windows 11, Release build.
 
+4-thread result (`--shards 3 --threads 4 --duration 30 --warmup 5 --warehouses 2`):
+
 | Metric | Value |
 |---|---:|
-| Throughput | 2.67 txn/sec |
-| Latency p50 | 373,457.70 us |
-| Latency p99 | 467,840.80 us |
-| Abort rate | 3.57% |
-| Committed | 27 |
-| Aborted | 1 |
-| New-Order | 18 |
-| Payment | 9 |
+| Throughput | 0.93 txn/sec |
+| Latency p50 | 63,969.90 us |
+| Latency p99 | 5,226,064.60 us |
+| Abort rate | 30.95% |
+| Committed | 29 |
+| Aborted | 13 |
+| New-Order | 16 |
+| Payment | 13 |
+
+1-thread result (`--shards 3 --threads 1 --duration 30 --warmup 5 --warehouses 2`):
+
+| Metric | Value |
+|---|---:|
+| Throughput | 37.20 txn/sec |
+| Latency p50 | 31,253.80 us |
+| Latency p99 | 32,746.50 us |
+| Abort rate | 0.00% |
+| Committed | 1116 |
+| Aborted | 0 |
+| New-Order | 681 |
+| Payment | 435 |
 
 ## Tests
 `ctest --test-dir build -C Release --output-on-failure`
