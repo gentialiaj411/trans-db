@@ -70,3 +70,19 @@
 - Verified prerequisite: `src/txn/wal.cpp` `WAL::Sync()` currently calls `std::ofstream::flush()` only (no explicit OS-level `fsync` / `FlushFileBuffers`).
 - Validation status:
   - `TODO/VERIFY`: Could not run build/tests in this environment due to CMake dependency resolution failure for `RocksDB` after path flattening and build-dir regeneration.
+
+## 2026-05-17 - Cleanup Pass
+
+- Removed clear bloat / generated artifacts:
+  - `INTERVIEW_GUIDE.md`
+  - `build/`
+  - `bench_data_mt3/`
+  - `bench_opt_mt3/`
+  - nested duplicate `trans-db/` directory
+- Intentionally preserved:
+  - `PROJECT_CONTEXT.md`
+  - `AGENT_HANDOFF/`
+  - source, tests, and architecture-related docs
+- Notes:
+  - `build/` was fully removed after a direct `rmdir` pass on `build\\vcpkg_installed`.
+  - No source files were touched.
