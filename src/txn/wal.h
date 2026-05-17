@@ -15,7 +15,11 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#undef DELETE  // windows.h defines DELETE as 0x00010000L; conflicts with WALRecordType::DELETE
 #endif
 
 namespace txndb {

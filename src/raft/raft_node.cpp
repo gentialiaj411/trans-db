@@ -3,6 +3,15 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <thread>
 
 namespace txndb {
@@ -481,6 +490,21 @@ void RaftNode::PersistMeta() const {
   out.write(buf, sizeof(buf));
   out.flush();
   out.close();
+#ifdef _WIN32
+  {
+    HANDLE h = CreateFileA(tmp.c_str(),
+                           GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr,
+                           OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+      FlushFileBuffers(h);
+      CloseHandle(h);
+    }
+  }
+#endif
   if (!out) {
     return;
   }

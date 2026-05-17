@@ -3,6 +3,15 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace txndb {
 
@@ -208,6 +217,22 @@ bool RaftLog::AppendEntryToFile(const RaftLogEntry& entry) {
   const std::string rec = SerializeRaftEntry(entry);
   out.write(rec.data(), static_cast<std::streamsize>(rec.size()));
   out.flush();
+  out.close();
+#ifdef _WIN32
+  {
+    HANDLE h = CreateFileA(path_.c_str(),
+                           GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr,
+                           OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+      FlushFileBuffers(h);
+      CloseHandle(h);
+    }
+  }
+#endif
   return static_cast<bool>(out);
 }
 
@@ -229,6 +254,21 @@ bool RaftLog::RewriteFileFromMemory() const {
   }
   out.flush();
   out.close();
+#ifdef _WIN32
+  {
+    HANDLE h = CreateFileA(tmp.c_str(),
+                           GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr,
+                           OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+      FlushFileBuffers(h);
+      CloseHandle(h);
+    }
+  }
+#endif
   if (!out) {
     return false;
   }
