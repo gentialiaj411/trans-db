@@ -199,6 +199,16 @@ Status WAL::Open(std::string_view pathv, std::unique_ptr<WAL>* out) {
   if (!wal->ofs_) {
     return Status::IOError("WAL open for append failed");
   }
+#ifdef _WIN32
+  wal->sync_handle_ = CreateFileA(
+      path.c_str(),
+      GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+#endif
 
   *out = std::move(wal);
   return Status::OK();
@@ -209,6 +219,12 @@ WAL::~WAL() {
     ofs_.flush();
     ofs_.close();
   }
+#ifdef _WIN32
+  if (sync_handle_ != INVALID_HANDLE_VALUE) {
+    CloseHandle(sync_handle_);
+    sync_handle_ = INVALID_HANDLE_VALUE;
+  }
+#endif
 }
 
 Status WAL::WriteRecord(uint64_t lsn, uint64_t txn_id, WALRecordType type,
@@ -249,6 +265,13 @@ Status WAL::Sync() {
   if (!ofs_) {
     return Status::IOError("WAL flush failed");
   }
+#ifdef _WIN32
+  if (sync_handle_ != INVALID_HANDLE_VALUE) {
+    if (!FlushFileBuffers(sync_handle_)) {
+      return Status::IOError("WAL FlushFileBuffers failed");
+    }
+  }
+#endif
   return Status::OK();
 }
 
@@ -298,6 +321,20 @@ Status WAL::Truncate() {
   if (!ofs_) {
     return Status::IOError("WAL reopen after truncate failed");
   }
+#ifdef _WIN32
+  if (sync_handle_ != INVALID_HANDLE_VALUE) {
+    CloseHandle(sync_handle_);
+    sync_handle_ = INVALID_HANDLE_VALUE;
+  }
+  sync_handle_ = CreateFileA(
+      path_.c_str(),
+      GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+#endif
   return Status::OK();
 }
 

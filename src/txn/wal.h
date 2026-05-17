@@ -11,6 +11,13 @@
 #include <string_view>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace txndb {
 
 enum class WALRecordType : uint8_t {
@@ -98,6 +105,9 @@ private:
   mutable std::mutex mu_;
   std::string path_;
   std::ofstream ofs_;
+#ifdef _WIN32
+  HANDLE sync_handle_{INVALID_HANDLE_VALUE};
+#endif
   uint64_t next_lsn_{1};
 };
 
