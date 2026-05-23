@@ -137,6 +137,26 @@ MVCCStore* ShardServiceImpl::GetLeaderStore() {
   return L ? L->store.get() : nullptr;
 }
 
+uint32_t ShardServiceImpl::GetLeaderReplicaId() const {
+  for (uint32_t i = 0; i < replicas_.size(); ++i) {
+    if (replicas_[i]->raft_node && replicas_[i]->raft_node->GetRole() == RaftRole::LEADER) {
+      return i;
+    }
+  }
+  return UINT32_MAX;
+}
+
+void ShardServiceImpl::DisconnectReplicaForTest(uint32_t replica_id) {
+  transport_.DisconnectNode(replica_id);
+}
+
+void ShardServiceImpl::ReconnectReplicaForTest(uint32_t replica_id) {
+  if (replica_id >= replicas_.size()) {
+    return;
+  }
+  transport_.ReconnectNode(replica_id, replicas_[replica_id]->raft_node.get());
+}
+
 grpc::Status ShardServiceImpl::Execute(grpc::ServerContext* /*context*/, const ExecuteRequest* request,
                                        ExecuteResponse* response) {
   ReplicaStack* L = FindLeader();
@@ -384,6 +404,7 @@ grpc::Status ShardServiceImpl::Commit(grpc::ServerContext* /*context*/, const Co
   if (ok) {
     std::scoped_lock lk(pending_mu_);
     pending_txns_.erase(request->raft_txn_id());
+    terminal_txn_states_[request->raft_txn_id()] = TxnStateCode::TXN_COMMITTED;
   }
   return grpc::Status::OK;
 }
@@ -412,6 +433,7 @@ grpc::Status ShardServiceImpl::Abort(grpc::ServerContext* /*context*/, const Abo
     L->state_machine->ForgetTxn(request->raft_txn_id());
     std::scoped_lock lk(pending_mu_);
     pending_txns_.erase(request->raft_txn_id());
+    terminal_txn_states_[request->raft_txn_id()] = TxnStateCode::TXN_ABORTED;
     response->set_ok(true);
     return grpc::Status::OK;
   }
@@ -421,14 +443,39 @@ grpc::Status ShardServiceImpl::Abort(grpc::ServerContext* /*context*/, const Abo
   if (ok) {
     std::scoped_lock lk(pending_mu_);
     pending_txns_.erase(request->raft_txn_id());
+    terminal_txn_states_[request->raft_txn_id()] = TxnStateCode::TXN_ABORTED;
   }
   response->set_ok(ok);
   return grpc::Status::OK;
 }
 
+grpc::Status ShardServiceImpl::QueryTxnState(grpc::ServerContext* /*context*/,
+                                             const TxnStateRequest* request,
+                                             TxnStateResponse* response) {
+  std::scoped_lock lk(pending_mu_);
+  auto t_it = terminal_txn_states_.find(request->raft_txn_id());
+  if (t_it != terminal_txn_states_.end()) {
+    response->set_ok(true);
+    response->set_state(t_it->second);
+    return grpc::Status::OK;
+  }
+
+  auto p_it = pending_txns_.find(request->raft_txn_id());
+  if (p_it != pending_txns_.end()) {
+    response->set_ok(true);
+    response->set_state(p_it->second.prepared_replicated ? TxnStateCode::TXN_PREPARED
+                                                         : TxnStateCode::TXN_IN_FLIGHT);
+    return grpc::Status::OK;
+  }
+
+  response->set_ok(true);
+  response->set_state(TxnStateCode::TXN_UNKNOWN);
+  return grpc::Status::OK;
+}
+
 ShardServer::ShardServer(uint32_t shard_id, const std::string& data_dir,
-                         const std::string& listen_addr)
-    : service_(shard_id, data_dir), listen_addr_(listen_addr) {}
+                         const std::string& listen_addr, uint32_t num_replicas)
+    : service_(shard_id, data_dir, num_replicas), listen_addr_(listen_addr) {}
 
 ShardServer::~ShardServer() { Stop(); }
 

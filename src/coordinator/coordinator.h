@@ -1,5 +1,6 @@
 #pragma once
 
+#include "coordinator/coordinator_log.h"
 #include "coordinator/timestamp.h"
 #include "storage/status.h"
 
@@ -31,7 +32,8 @@ struct CoordinatorTxn {
 class Coordinator {
 public:
   Coordinator(const std::unordered_map<uint32_t, std::string>& shard_addresses,
-              uint32_t num_shards);
+              uint32_t num_shards,
+              std::string coordinator_log_path = {});
   ~Coordinator() = default;
 
   uint64_t Begin();
@@ -50,6 +52,7 @@ public:
   Status Commit(uint64_t txn_id);
 
   Status Abort(uint64_t txn_id);
+  Status Recover();
 
 private:
   static constexpr auto kGrpcTimeout = std::chrono::seconds(5);
@@ -66,6 +69,11 @@ private:
   Status SingleShardCommit(uint64_t raft_txn_id, uint32_t shard_id, uint64_t commit_ts);
 
   static void ApplyDeadline(grpc::ClientContext* ctx);
+  Status AppendCoordinatorRecord(CoordinatorLogRecordType type, uint64_t txn_id,
+                                 const std::vector<uint32_t>& shards = {});
+  Status DriveCommit(uint64_t txn_id, const std::vector<uint32_t>& shards);
+  Status DriveAbort(uint64_t txn_id, const std::vector<uint32_t>& shards);
+  TxnStateCode QueryShardTxnState(uint32_t shard_id, uint64_t txn_id);
 
   uint32_t num_shards_{0};
   TimestampOracle ts_oracle_;
@@ -76,6 +84,7 @@ private:
 
   std::unordered_map<uint32_t, std::shared_ptr<grpc::Channel>> channels_;
   std::unordered_map<uint32_t, std::unique_ptr<ShardService::Stub>> stubs_;
+  std::unique_ptr<CoordinatorLog> coordinator_log_;
 };
 
 }  // namespace txndb

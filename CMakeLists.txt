@@ -107,6 +107,7 @@ target_compile_definitions(trans_db_shard PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 
 add_library(trans_db_coordinator
   src/coordinator/coordinator.cpp
+  src/coordinator/coordinator_log.cpp
 )
 target_include_directories(trans_db_coordinator PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(trans_db_coordinator PUBLIC trans_db_proto)
@@ -116,6 +117,10 @@ add_executable(test_e2e test/test_e2e.cpp)
 target_compile_definitions(test_e2e PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(test_e2e PRIVATE trans_db_shard trans_db_coordinator trans_db_storage GTest::gtest_main)
 add_test(NAME e2e COMMAND test_e2e)
+
+add_executable(test_coordinator_log test/test_coordinator_log.cpp)
+target_link_libraries(test_coordinator_log PRIVATE trans_db_coordinator GTest::gtest_main)
+add_test(NAME coordinator_log COMMAND test_coordinator_log)
 
 add_library(trans_db_sql
   src/coordinator/catalog.cpp

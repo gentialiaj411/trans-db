@@ -55,11 +55,17 @@ public:
 
   grpc::Status Abort(grpc::ServerContext* context, const AbortRequest* request,
                      AbortResponse* response) override;
+  grpc::Status QueryTxnState(grpc::ServerContext* context, const TxnStateRequest* request,
+                             TxnStateResponse* response) override;
 
   MVCCStore* GetReplicaStore(uint32_t replica_id);
   TxnManager* GetReplicaTxnMgr(uint32_t replica_id);
   /// Leader's MVCC store (for tests).
   MVCCStore* GetLeaderStore();
+  uint32_t GetLeaderReplicaId() const;
+  uint32_t NumReplicas() const { return static_cast<uint32_t>(replicas_.size()); }
+  void DisconnectReplicaForTest(uint32_t replica_id);
+  void ReconnectReplicaForTest(uint32_t replica_id);
 
 private:
   ReplicaStack* FindLeader();
@@ -74,11 +80,13 @@ private:
   std::vector<std::unique_ptr<ReplicaStack>> replicas_;
   std::mutex pending_mu_;
   std::unordered_map<uint64_t, PendingTxn> pending_txns_;
+  std::unordered_map<uint64_t, TxnStateCode> terminal_txn_states_;
 };
 
 class ShardServer {
 public:
-  ShardServer(uint32_t shard_id, const std::string& data_dir, const std::string& listen_addr);
+  ShardServer(uint32_t shard_id, const std::string& data_dir, const std::string& listen_addr,
+              uint32_t num_replicas = 3);
   ~ShardServer();
 
   void Start();

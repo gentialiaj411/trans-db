@@ -2,6 +2,7 @@
 
 #include "shard/shard_server.h"
 #include "coordinator/coordinator.h"
+#include "coordinator/coordinator_log.h"
 #include "txn/wal.h"
 
 #include <atomic>
@@ -114,7 +115,8 @@ protected:
       shards_.push_back(std::move(s));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(600));
-    coordinator_ = std::make_unique<Coordinator>(shard_addrs_, kShards);
+    coordinator_log_path_ = base_dir_ + "/coordinator.log";
+    coordinator_ = std::make_unique<Coordinator>(shard_addrs_, kShards, coordinator_log_path_);
   }
 
   void StopCluster() {
@@ -147,7 +149,80 @@ protected:
     s->Start();
     shards_[shard_id] = std::move(s);
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    coordinator_ = std::make_unique<Coordinator>(shard_addrs_, kShards);
+    coordinator_ = std::make_unique<Coordinator>(shard_addrs_, kShards, coordinator_log_path_);
+  }
+
+  bool RpcBegin(uint32_t sid, uint64_t txn_id, uint64_t snapshot_ts) {
+    auto ch = grpc::CreateChannel(shard_addrs_.at(sid), grpc::InsecureChannelCredentials());
+    auto stub = ShardService::NewStub(ch);
+    grpc::ClientContext ctx;
+    ExecuteRequest req;
+    req.set_raft_txn_id(txn_id);
+    req.set_op(OP_BEGIN);
+    req.set_snapshot_ts(snapshot_ts);
+    ExecuteResponse resp;
+    return stub->Execute(&ctx, req, &resp).ok() && resp.ok();
+  }
+
+  bool RpcWrite(uint32_t sid, uint64_t txn_id, const std::string& key, const std::string& value) {
+    auto ch = grpc::CreateChannel(shard_addrs_.at(sid), grpc::InsecureChannelCredentials());
+    auto stub = ShardService::NewStub(ch);
+    grpc::ClientContext ctx;
+    ExecuteRequest req;
+    req.set_raft_txn_id(txn_id);
+    req.set_op(OP_WRITE);
+    req.set_table_id(kTable);
+    req.set_key(key);
+    req.set_value(RowFromValue(value));
+    ExecuteResponse resp;
+    return stub->Execute(&ctx, req, &resp).ok() && resp.ok();
+  }
+
+  bool RpcPrepare(uint32_t sid, uint64_t txn_id, uint64_t commit_ts) {
+    auto ch = grpc::CreateChannel(shard_addrs_.at(sid), grpc::InsecureChannelCredentials());
+    auto stub = ShardService::NewStub(ch);
+    grpc::ClientContext ctx;
+    PrepareRequest req;
+    req.set_raft_txn_id(txn_id);
+    req.set_commit_ts(commit_ts);
+    PrepareResponse resp;
+    return stub->Prepare(&ctx, req, &resp).ok() && resp.vote_commit();
+  }
+
+  bool RpcCommit(uint32_t sid, uint64_t txn_id, uint64_t commit_ts) {
+    auto ch = grpc::CreateChannel(shard_addrs_.at(sid), grpc::InsecureChannelCredentials());
+    auto stub = ShardService::NewStub(ch);
+    grpc::ClientContext ctx;
+    CommitRequest req;
+    req.set_raft_txn_id(txn_id);
+    req.set_commit_ts(commit_ts);
+    CommitResponse resp;
+    return stub->Commit(&ctx, req, &resp).ok() && resp.ok();
+  }
+
+  bool KeysAllVisible(const std::vector<std::string>& keys) {
+    for (const auto& k : keys) {
+      std::string v;
+      if (!ReadKV(k, &v)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  std::vector<std::string> OneKeyPerShard(const std::string& prefix) {
+    std::vector<std::string> keys(kShards);
+    std::vector<bool> picked(kShards, false);
+    for (int i = 0; i < 200000 && !(picked[0] && picked[1] && picked[2]); ++i) {
+      std::string k = prefix + "_" + std::to_string(i);
+      const uint32_t sid = RouteKey(k, kShards);
+      if (!picked[sid]) {
+        picked[sid] = true;
+        keys[sid] = k;
+      }
+    }
+    EXPECT_TRUE(picked[0] && picked[1] && picked[2]);
+    return keys;
   }
 
   void WriteKV(const std::string& key, const std::string& value) {
@@ -174,18 +249,22 @@ protected:
     if (sid >= shards_.size() || !shards_[sid]) {
       return false;
     }
-    MVCCStore* store = shards_[sid]->GetService()->GetLeaderStore();
-    if (!store) {
-      return false;
+    auto* svc = shards_[sid]->GetService();
+    for (uint32_t rid = 0; rid < svc->NumReplicas(); ++rid) {
+      MVCCStore* store = svc->GetReplicaStore(rid);
+      if (!store) {
+        continue;
+      }
+      std::string row;
+      uint64_t ts = 0;
+      const Status s = store->Get(kTable, key, UINT64_MAX / 4, &row, &ts);
+      if (!s.ok()) {
+        continue;
+      }
+      *value = ValueFromRow(row);
+      return true;
     }
-    std::string row;
-    uint64_t ts = 0;
-    const Status s = store->Get(kTable, key, UINT64_MAX / 4, &row, &ts);
-    if (!s.ok()) {
-      return false;
-    }
-    *value = ValueFromRow(row);
-    return true;
+    return false;
   }
 
   static constexpr uint32_t kShards = 3;
@@ -195,6 +274,7 @@ protected:
   std::unordered_map<uint32_t, std::string> shard_addrs_;
   std::unique_ptr<Coordinator> coordinator_;
   std::string base_dir_;
+  std::string coordinator_log_path_;
   int base_port_{0};
 };
 
@@ -226,7 +306,50 @@ TEST_F(FaultTest, AbortedDataNotVisibleAfterRestart) {
 }
 
 TEST_F(FaultTest, SingleReplicaFailureNoDataLoss) {
-  GTEST_SKIP() << "ShardServer does not expose replica-level disconnect/kill API; skipping.";
+  ASSERT_FALSE(shards_.empty());
+  auto* svc = shards_[0]->GetService();
+  ASSERT_NE(svc, nullptr);
+  const uint32_t leader_replica = svc->GetLeaderReplicaId();
+  ASSERT_NE(leader_replica, UINT32_MAX);
+  const uint32_t failed_replica = (leader_replica + 1) % svc->NumReplicas();
+
+  auto key_for_shard0 = [&]() {
+    for (int i = 0; i < 200000; ++i) {
+      std::string k = "srk_" + std::to_string(i);
+      if (RouteKey(k, kShards) == 0u) {
+        return k;
+      }
+    }
+    return std::string("srk_fallback");
+  };
+  const std::string pre_key = key_for_shard0();
+  const std::string post_key = pre_key + "_post";
+  WriteKV(pre_key, "pre_value");
+
+  svc->DisconnectReplicaForTest(failed_replica);
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+
+  WriteKV(post_key, "post_value");
+
+  svc->ReconnectReplicaForTest(failed_replica);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+  auto read_eventually = [&](const std::string& k, std::string* out) {
+    for (int r = 0; r < 30; ++r) {
+      if (ReadKVDurable(k, out)) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+  };
+
+  std::string pre_v;
+  ASSERT_TRUE(read_eventually(pre_key, &pre_v));
+  EXPECT_EQ(pre_v, "pre_value");
+  std::string post_v;
+  ASSERT_TRUE(read_eventually(post_key, &post_v));
+  EXPECT_EQ(post_v, "post_value");
 }
 
 TEST_F(FaultTest, WALPowerLossDurability) {
@@ -411,4 +534,125 @@ TEST_F(FaultTest, ReadOnlyTransactionNoLocks) {
 
   writer.join();
   EXPECT_TRUE(writer_done.load());
+}
+
+TEST_F(FaultTest, CoordinatorCrashAfterPrepareLog) {
+  const uint64_t txn_id = 91001;
+  std::vector<uint32_t> shards{0, 1, 2};
+
+  std::unique_ptr<CoordinatorLog> log;
+  ASSERT_TRUE(CoordinatorLog::Open(coordinator_log_path_, &log).ok());
+  ASSERT_TRUE(log->Append(CoordinatorLogRecord{
+      CoordinatorLogRecordType::PREPARING, txn_id, 1, shards}).ok());
+
+  coordinator_.reset();
+  coordinator_ = std::make_unique<Coordinator>(shard_addrs_, kShards, coordinator_log_path_);
+
+  auto keys = OneKeyPerShard("cpa");
+  for (const auto& k : keys) {
+    std::string v;
+    EXPECT_FALSE(ReadKV(k, &v));
+  }
+}
+
+TEST_F(FaultTest, CoordinatorCrashBetweenPrepareAndCommit) {
+  const uint64_t txn_id = 91002;
+  const uint64_t snap = 1;
+  const uint64_t prepare_ts = 2;
+  auto keys = OneKeyPerShard("cpbc");
+  std::vector<uint32_t> shards{0, 1, 2};
+
+  for (uint32_t sid : shards) {
+    ASSERT_TRUE(RpcBegin(sid, txn_id, snap));
+    ASSERT_TRUE(RpcWrite(sid, txn_id, keys[sid], "v" + std::to_string(sid)));
+  }
+  for (uint32_t sid : shards) {
+    ASSERT_TRUE(RpcPrepare(sid, txn_id, prepare_ts));
+  }
+
+  std::unique_ptr<CoordinatorLog> log;
+  ASSERT_TRUE(CoordinatorLog::Open(coordinator_log_path_, &log).ok());
+  ASSERT_TRUE(log->Append(CoordinatorLogRecord{
+      CoordinatorLogRecordType::PREPARING, txn_id, 2, shards}).ok());
+
+  coordinator_.reset();
+  coordinator_ = std::make_unique<Coordinator>(shard_addrs_, kShards, coordinator_log_path_);
+  std::string post_recover_v0;
+  ASSERT_TRUE(ReadKVDurable(keys[0], &post_recover_v0));
+  ASSERT_EQ(post_recover_v0, "v0");
+  for (size_t i = 0; i < keys.size(); ++i) {
+    std::string v;
+    EXPECT_TRUE(ReadKV(keys[i], &v)) << "missing key for shard " << i << ": " << keys[i];
+    if (!v.empty()) {
+      EXPECT_EQ(v, "v" + std::to_string(i));
+    }
+  }
+}
+
+TEST_F(FaultTest, CoordinatorCrashAfterCommittingLog) {
+  const uint64_t txn_id = 91003;
+  const uint64_t snap = 1;
+  const uint64_t prepare_ts = 2;
+  auto keys = OneKeyPerShard("cpcl");
+  std::vector<uint32_t> shards{0, 1, 2};
+
+  for (uint32_t sid : shards) {
+    ASSERT_TRUE(RpcBegin(sid, txn_id, snap));
+    ASSERT_TRUE(RpcWrite(sid, txn_id, keys[sid], "v" + std::to_string(sid)));
+    ASSERT_TRUE(RpcPrepare(sid, txn_id, prepare_ts));
+  }
+
+  std::unique_ptr<CoordinatorLog> log;
+  ASSERT_TRUE(CoordinatorLog::Open(coordinator_log_path_, &log).ok());
+  ASSERT_TRUE(log->Append(CoordinatorLogRecord{
+      CoordinatorLogRecordType::PREPARING, txn_id, 3, shards}).ok());
+  ASSERT_TRUE(log->Append(CoordinatorLogRecord{
+      CoordinatorLogRecordType::COMMITTING, txn_id, 4, {}}).ok());
+
+  coordinator_.reset();
+  coordinator_ = std::make_unique<Coordinator>(shard_addrs_, kShards, coordinator_log_path_);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    std::string v;
+    EXPECT_TRUE(ReadKV(keys[i], &v)) << "missing key for shard " << i << ": " << keys[i];
+    if (!v.empty()) {
+      EXPECT_EQ(v, "v" + std::to_string(i));
+    }
+  }
+}
+
+TEST_F(FaultTest, CoordinatorCrashAfterPartialCommit) {
+  const uint64_t txn_id = 91004;
+  const uint64_t snap = 1;
+  const uint64_t prepare_ts = 1;
+  const uint64_t first_commit_ts = 1;
+  auto keys = OneKeyPerShard("cppc");
+  std::vector<uint32_t> shards{0, 1, 2};
+
+  for (uint32_t sid : shards) {
+    ASSERT_TRUE(RpcBegin(sid, txn_id, snap));
+    ASSERT_TRUE(RpcWrite(sid, txn_id, keys[sid], "v" + std::to_string(sid)));
+    ASSERT_TRUE(RpcPrepare(sid, txn_id, prepare_ts));
+  }
+
+  ASSERT_TRUE(RpcCommit(shards[0], txn_id, first_commit_ts));
+  std::string pre_recover_v0;
+  ASSERT_TRUE(ReadKVDurable(keys[0], &pre_recover_v0));
+  ASSERT_EQ(pre_recover_v0, "v0");
+
+  std::unique_ptr<CoordinatorLog> log;
+  ASSERT_TRUE(CoordinatorLog::Open(coordinator_log_path_, &log).ok());
+  ASSERT_TRUE(log->Append(CoordinatorLogRecord{
+      CoordinatorLogRecordType::PREPARING, txn_id, 5, shards}).ok());
+  ASSERT_TRUE(log->Append(CoordinatorLogRecord{
+      CoordinatorLogRecordType::COMMITTING, txn_id, 6, {}}).ok());
+
+  coordinator_.reset();
+  coordinator_ = std::make_unique<Coordinator>(shard_addrs_, kShards, coordinator_log_path_);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    std::string v;
+    EXPECT_TRUE(ReadKV(keys[i], &v)) << "missing key for shard " << i << ": " << keys[i];
+    if (!v.empty()) {
+      EXPECT_EQ(v, "v" + std::to_string(i));
+    }
+  }
 }

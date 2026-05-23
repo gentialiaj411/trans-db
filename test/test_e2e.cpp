@@ -6,6 +6,7 @@
 #include "storage/mvcc_store.h"
 
 #include "coordinator/coordinator.h"
+#include "coordinator/coordinator_log.h"
 
 #include <algorithm>
 #include <chrono>
@@ -14,6 +15,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -71,7 +73,8 @@ protected:
 
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
-    coordinator_ = std::make_unique<Coordinator>(addrs, kShards);
+    coordinator_log_path_ = base_dir_ + "/coordinator.log";
+    coordinator_ = std::make_unique<Coordinator>(addrs, kShards, coordinator_log_path_);
   }
 
   void TearDown() override {
@@ -95,6 +98,7 @@ protected:
   std::vector<std::unique_ptr<ShardServer>> shard_servers_;
   std::unique_ptr<Coordinator> coordinator_;
   std::string base_dir_;
+  std::string coordinator_log_path_;
 };
 
 TEST_F(E2ETest, SingleShardWriteRead) {
@@ -330,4 +334,58 @@ TEST_F(E2ETest, CoordinatorRangeScanFansOutShards) {
   EXPECT_EQ(rows[1].first, "zr_m");
   EXPECT_EQ(rows[2].first, "zr_z");
   ASSERT_TRUE(Coord()->Commit(txn).ok());
+}
+
+TEST(CoordinatorLog, HappyPathCommitLogged) {
+  std::srand(static_cast<unsigned>(std::chrono::steady_clock::now().time_since_epoch().count()));
+  const std::string base_dir = UniqueBase();
+  const int base_port = 30000 + (std::rand() % 10000);
+  constexpr uint32_t kShardsLocal = 3;
+  constexpr uint32_t kTableLocal = 1;
+
+  std::unordered_map<uint32_t, std::string> addrs;
+  std::vector<std::unique_ptr<ShardServer>> shard_servers;
+  for (uint32_t i = 0; i < kShardsLocal; ++i) {
+    const std::string addr = "127.0.0.1:" + std::to_string(base_port + static_cast<int>(i));
+    addrs[i] = addr;
+    const std::string d = base_dir + "/s" + std::to_string(i);
+    shard_servers.push_back(std::make_unique<ShardServer>(i, d, addr));
+    shard_servers.back()->Start();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+  const std::string coordinator_log_path = base_dir + "/coordinator.log";
+  Coordinator coord(addrs, kShardsLocal, coordinator_log_path);
+
+  std::string ka, kb;
+  for (unsigned i = 0; i < 50000; ++i) {
+    ka = "cl_a_" + std::to_string(i);
+    kb = "cl_b_" + std::to_string(i);
+    if (RouteKey(ka, kShardsLocal) != RouteKey(kb, kShardsLocal)) {
+      break;
+    }
+  }
+  ASSERT_NE(RouteKey(ka, kShardsLocal), RouteKey(kb, kShardsLocal));
+
+  uint64_t tx = coord.Begin();
+  ASSERT_TRUE(coord.Write(tx, kTableLocal, ka, "va").ok());
+  ASSERT_TRUE(coord.Write(tx, kTableLocal, kb, "vb").ok());
+  ASSERT_TRUE(coord.Commit(tx).ok());
+
+  std::unique_ptr<CoordinatorLog> log;
+  ASSERT_TRUE(CoordinatorLog::Open(coordinator_log_path, &log).ok());
+  std::vector<CoordinatorLogRecordType> states;
+  ASSERT_TRUE(log->Replay([&](const CoordinatorLogRecord& r) {
+    if (r.txn_id == tx) {
+      states.push_back(r.type);
+    }
+  }).ok());
+
+  ASSERT_EQ(states.size(), 3u);
+  EXPECT_EQ(states[0], CoordinatorLogRecordType::PREPARING);
+  EXPECT_EQ(states[1], CoordinatorLogRecordType::COMMITTING);
+  EXPECT_EQ(states[2], CoordinatorLogRecordType::COMMITTED);
+
+  shard_servers.clear();
+  Nuke(base_dir);
 }

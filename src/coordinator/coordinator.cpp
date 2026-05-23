@@ -1,6 +1,8 @@
 #include "coordinator/coordinator.h"
 
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
 #include <future>
 #include <stdexcept>
 
@@ -34,8 +36,16 @@ void Coordinator::ApplyDeadline(grpc::ClientContext* ctx) {
 }
 
 Coordinator::Coordinator(const std::unordered_map<uint32_t, std::string>& shard_addresses,
-                         uint32_t num_shards)
+                         uint32_t num_shards,
+                         std::string coordinator_log_path)
     : num_shards_(num_shards) {
+  if (coordinator_log_path.empty()) {
+    coordinator_log_path = (std::filesystem::temp_directory_path() / "trans_db_coordinator.log").string();
+  }
+  if (!CoordinatorLog::Open(coordinator_log_path, &coordinator_log_).ok()) {
+    throw std::runtime_error("failed to open coordinator log");
+  }
+
   for (const auto& [id, addr] : shard_addresses) {
     if (id >= num_shards) {
       throw std::invalid_argument("shard id out of range");
@@ -44,6 +54,10 @@ Coordinator::Coordinator(const std::unordered_map<uint32_t, std::string>& shard_
         grpc::CreateCustomChannel(addr, grpc::InsecureChannelCredentials(), MakeChannelArgs());
     channels_[id] = std::move(ch);
     stubs_[id] = ShardService::NewStub(channels_[id]);
+  }
+  Status rs = Recover();
+  if (!rs.ok()) {
+    throw std::runtime_error("coordinator recover failed: " + rs.message());
   }
 }
 
@@ -97,6 +111,226 @@ uint64_t Coordinator::Begin() {
   txn->aborted = false;
   txns_[raft_txn_id] = std::move(txn);
   return raft_txn_id;
+}
+
+Status Coordinator::AppendCoordinatorRecord(CoordinatorLogRecordType type, uint64_t txn_id,
+                                            const std::vector<uint32_t>& shards) {
+  if (!coordinator_log_) {
+    return Status::IOError("coordinator log unavailable");
+  }
+  CoordinatorLogRecord rec;
+  rec.type = type;
+  rec.txn_id = txn_id;
+  rec.timestamp_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  rec.shards = shards;
+  return coordinator_log_->Append(rec);
+}
+
+TxnStateCode Coordinator::QueryShardTxnState(uint32_t shard_id, uint64_t txn_id) {
+  ShardService::Stub* stub = GetStub(shard_id);
+  if (!stub) {
+    return TxnStateCode::TXN_UNKNOWN;
+  }
+  grpc::ClientContext ctx;
+  ApplyDeadline(&ctx);
+  TxnStateRequest req;
+  req.set_raft_txn_id(txn_id);
+  TxnStateResponse resp;
+  if (!stub->QueryTxnState(&ctx, req, &resp).ok() || !resp.ok()) {
+    return TxnStateCode::TXN_UNKNOWN;
+  }
+  return resp.state();
+}
+
+Status Coordinator::DriveCommit(uint64_t txn_id, const std::vector<uint32_t>& shards) {
+  const uint64_t commit_ts = ts_oracle_.Now();
+  std::vector<std::future<bool>> commit_futs;
+  commit_futs.reserve(shards.size());
+  for (uint32_t sid : shards) {
+    commit_futs.push_back(std::async(std::launch::async, [this, txn_id, sid, commit_ts]() {
+      ShardService::Stub* stub = GetStub(sid);
+      if (!stub) {
+        return false;
+      }
+      grpc::ClientContext ctx;
+      ApplyDeadline(&ctx);
+      CommitRequest cr;
+      cr.set_raft_txn_id(txn_id);
+      cr.set_commit_ts(commit_ts);
+      CommitResponse cresp;
+      return stub->Commit(&ctx, cr, &cresp).ok() && cresp.ok();
+    }));
+  }
+  for (auto& f : commit_futs) {
+    if (!f.get()) {
+      return Status::IOError("recovery commit failed");
+    }
+  }
+  return Status::OK();
+}
+
+Status Coordinator::DriveAbort(uint64_t txn_id, const std::vector<uint32_t>& shards) {
+  std::vector<std::future<void>> abort_futs;
+  abort_futs.reserve(shards.size());
+  for (uint32_t sid : shards) {
+    abort_futs.push_back(std::async(std::launch::async, [this, txn_id, sid]() {
+      ShardService::Stub* stub = GetStub(sid);
+      if (!stub) {
+        return;
+      }
+      grpc::ClientContext ctx;
+      ApplyDeadline(&ctx);
+      AbortRequest ar;
+      ar.set_raft_txn_id(txn_id);
+      AbortResponse aresp;
+      (void)stub->Abort(&ctx, ar, &aresp).ok();
+    }));
+  }
+  for (auto& f : abort_futs) {
+    f.wait();
+  }
+  return Status::OK();
+}
+
+Status Coordinator::Recover() {
+  if (!coordinator_log_) {
+    return Status::OK();
+  }
+
+  struct TxnRecoveryState {
+    std::vector<uint32_t> shards;
+    bool saw_preparing{false};
+    bool saw_committing{false};
+    bool saw_committed{false};
+    bool saw_aborting{false};
+    bool saw_aborted{false};
+  };
+  std::unordered_map<uint64_t, TxnRecoveryState> states;
+  Status rs = coordinator_log_->Replay([&](const CoordinatorLogRecord& rec) {
+    auto& st = states[rec.txn_id];
+    if (rec.type == CoordinatorLogRecordType::PREPARING) {
+      st.saw_preparing = true;
+      st.shards = rec.shards;
+    } else if (rec.type == CoordinatorLogRecordType::COMMITTING) {
+      st.saw_committing = true;
+    } else if (rec.type == CoordinatorLogRecordType::COMMITTED) {
+      st.saw_committed = true;
+    } else if (rec.type == CoordinatorLogRecordType::ABORTING) {
+      st.saw_aborting = true;
+    } else if (rec.type == CoordinatorLogRecordType::ABORTED) {
+      st.saw_aborted = true;
+    }
+  });
+  if (!rs.ok()) {
+    return rs;
+  }
+
+  for (const auto& [txn_id, st] : states) {
+    if (!st.saw_preparing || st.saw_committed || st.saw_aborted) {
+      continue;
+    }
+    if (st.shards.empty()) {
+      continue;
+    }
+
+    if (st.saw_committing) {
+      Status ls = AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTING, txn_id);
+      if (!ls.ok()) {
+        return ls;
+      }
+      Status cs = DriveCommit(txn_id, st.shards);
+      if (!cs.ok()) {
+        return cs;
+      }
+      ls = AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTED, txn_id);
+      if (!ls.ok()) {
+        return ls;
+      }
+      continue;
+    }
+
+    if (st.saw_aborting) {
+      Status ls = AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTING, txn_id);
+      if (!ls.ok()) {
+        return ls;
+      }
+      Status as = DriveAbort(txn_id, st.shards);
+      if (!as.ok()) {
+        return as;
+      }
+      ls = AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTED, txn_id);
+      if (!ls.ok()) {
+        return ls;
+      }
+      continue;
+    }
+
+    bool any_aborted = false;
+    bool any_committed = false;
+    bool all_prepared = true;
+    for (uint32_t sid : st.shards) {
+      TxnStateCode ss = QueryShardTxnState(sid, txn_id);
+      if (ss == TxnStateCode::TXN_ABORTED) {
+        any_aborted = true;
+      }
+      if (ss == TxnStateCode::TXN_COMMITTED) {
+        any_committed = true;
+      }
+      if (ss != TxnStateCode::TXN_PREPARED && ss != TxnStateCode::TXN_COMMITTED) {
+        all_prepared = false;
+      }
+    }
+
+    if (any_aborted) {
+      Status ls = AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTING, txn_id);
+      if (!ls.ok()) {
+        return ls;
+      }
+      Status as = DriveAbort(txn_id, st.shards);
+      if (!as.ok()) {
+        return as;
+      }
+      ls = AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTED, txn_id);
+      if (!ls.ok()) {
+        return ls;
+      }
+      continue;
+    }
+
+    if (all_prepared || any_committed) {
+      Status ls = AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTING, txn_id);
+      if (!ls.ok()) {
+        return ls;
+      }
+      Status cs = DriveCommit(txn_id, st.shards);
+      if (!cs.ok()) {
+        return cs;
+      }
+      ls = AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTED, txn_id);
+      if (!ls.ok()) {
+        return ls;
+      }
+      continue;
+    }
+
+    Status ls = AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTING, txn_id);
+    if (!ls.ok()) {
+      return ls;
+    }
+    Status as = DriveAbort(txn_id, st.shards);
+    if (!as.ok()) {
+      return as;
+    }
+    ls = AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTED, txn_id);
+    if (!ls.ok()) {
+      return ls;
+    }
+  }
+
+  return Status::OK();
 }
 
 Status Coordinator::Read(uint64_t txn_id, uint32_t table_id, std::string_view key,
@@ -280,6 +514,11 @@ Status Coordinator::Scan(uint64_t txn_id, uint32_t table_id, std::string_view ra
 
 Status Coordinator::SingleShardCommit(uint64_t raft_txn_id, uint32_t shard_id,
                                      uint64_t commit_ts) {
+  std::vector<uint32_t> parts{shard_id};
+  Status ls = AppendCoordinatorRecord(CoordinatorLogRecordType::PREPARING, raft_txn_id, parts);
+  if (!ls.ok()) {
+    return ls;
+  }
   ShardService::Stub* stub = GetStub(shard_id);
   if (!stub) {
     return Status::IOError("missing stub");
@@ -294,15 +533,24 @@ Status Coordinator::SingleShardCommit(uint64_t raft_txn_id, uint32_t shard_id,
     return Status::IOError("Prepare RPC failed");
   }
   if (!presp.vote_commit()) {
+    Status abort_log = AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTING, raft_txn_id);
+    if (!abort_log.ok()) {
+      return abort_log;
+    }
     grpc::ClientContext abort_ctx;
     ApplyDeadline(&abort_ctx);
     AbortRequest ar;
     ar.set_raft_txn_id(raft_txn_id);
     AbortResponse aresp;
     (void)stub->Abort(&abort_ctx, ar, &aresp);
+    (void)AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTED, raft_txn_id);
     return Status::Error(StatusCode::Conflict, presp.error_message());
   }
 
+  ls = AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTING, raft_txn_id);
+  if (!ls.ok()) {
+    return ls;
+  }
   grpc::ClientContext cctx;
   ApplyDeadline(&cctx);
   CommitRequest cr;
@@ -312,11 +560,15 @@ Status Coordinator::SingleShardCommit(uint64_t raft_txn_id, uint32_t shard_id,
   if (!stub->Commit(&cctx, cr, &cresp).ok() || !cresp.ok()) {
     return Status::IOError("Commit RPC failed");
   }
-  return Status::OK();
+  return AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTED, raft_txn_id);
 }
 
 Status Coordinator::TwoPhaseCommit(uint64_t raft_txn_id, std::vector<uint32_t> parts,
                                    uint64_t commit_ts) {
+  Status ls = AppendCoordinatorRecord(CoordinatorLogRecordType::PREPARING, raft_txn_id, parts);
+  if (!ls.ok()) {
+    return ls;
+  }
   std::vector<std::future<std::pair<uint32_t, PrepareResponse>>> prep_futs;
   prep_futs.reserve(parts.size());
   for (uint32_t sid : parts) {
@@ -346,6 +598,10 @@ Status Coordinator::TwoPhaseCommit(uint64_t raft_txn_id, std::vector<uint32_t> p
   }
 
   if (!all_vote_commit) {
+    ls = AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTING, raft_txn_id);
+    if (!ls.ok()) {
+      return ls;
+    }
     std::vector<std::future<void>> abort_futs;
     for (uint32_t sid : parts) {
       abort_futs.push_back(std::async(std::launch::async, [this, raft_txn_id, sid]() {
@@ -364,9 +620,14 @@ Status Coordinator::TwoPhaseCommit(uint64_t raft_txn_id, std::vector<uint32_t> p
     for (auto& f : abort_futs) {
       f.wait();
     }
+    (void)AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTED, raft_txn_id);
     return Status::Error(StatusCode::Conflict, "2PC prepare failed");
   }
 
+  ls = AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTING, raft_txn_id);
+  if (!ls.ok()) {
+    return ls;
+  }
   std::vector<std::future<bool>> commit_futs;
   for (uint32_t sid : parts) {
     commit_futs.push_back(std::async(std::launch::async, [this, raft_txn_id, sid, commit_ts]() {
@@ -388,7 +649,7 @@ Status Coordinator::TwoPhaseCommit(uint64_t raft_txn_id, std::vector<uint32_t> p
       return Status::IOError("2PC commit failed");
     }
   }
-  return Status::OK();
+  return AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTED, raft_txn_id);
 }
 
 Status Coordinator::Commit(uint64_t txn_id) {
@@ -442,6 +703,9 @@ Status Coordinator::Abort(uint64_t txn_id) {
     txns_.erase(tit);
   }
 
+  if (!parts.empty()) {
+    (void)AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTING, raft_tid);
+  }
   std::vector<std::future<void>> futs;
   for (uint32_t sid : parts) {
     futs.push_back(std::async(std::launch::async, [this, sid, raft_tid]() {
@@ -459,6 +723,9 @@ Status Coordinator::Abort(uint64_t txn_id) {
   }
   for (auto& f : futs) {
     f.wait();
+  }
+  if (!parts.empty()) {
+    (void)AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTED, raft_tid);
   }
   return Status::OK();
 }
