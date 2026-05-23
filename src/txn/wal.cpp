@@ -8,6 +8,11 @@
 #include <functional>
 #include <vector>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 constexpr uint32_t kCrc32Poly = 0xEDB88320;
@@ -128,6 +133,39 @@ bool ParseRecordsFromBytes(const uint8_t* data, size_t nbytes,
 
 namespace txndb {
 
+namespace {
+
+Status DurableFileSync(std::ofstream* ofs
+#ifdef _WIN32
+                       , HANDLE sync_handle
+#else
+                       , int sync_fd
+#endif
+) {
+  ofs->flush();
+  if (!(*ofs)) {
+    return Status::IOError("WAL flush failed");
+  }
+#ifdef _WIN32
+  if (sync_handle == INVALID_HANDLE_VALUE) {
+    return Status::IOError("WAL sync handle unavailable");
+  }
+  if (!FlushFileBuffers(sync_handle)) {
+    return Status::IOError("WAL FlushFileBuffers failed");
+  }
+#else
+  if (sync_fd < 0) {
+    return Status::IOError("WAL sync fd unavailable");
+  }
+  if (::fsync(sync_fd) != 0) {
+    return Status::IOError("WAL fsync failed");
+  }
+#endif
+  return Status::OK();
+}
+
+}  // namespace
+
 void WAL::AppendFixedU8(std::string* dst, uint8_t v) {
   dst->push_back(static_cast<char>(v));
 }
@@ -208,6 +246,8 @@ Status WAL::Open(std::string_view pathv, std::unique_ptr<WAL>* out) {
       OPEN_EXISTING,
       FILE_ATTRIBUTE_NORMAL,
       nullptr);
+#else
+  wal->sync_fd_ = ::open(path.c_str(), O_WRONLY);
 #endif
 
   *out = std::move(wal);
@@ -223,6 +263,11 @@ WAL::~WAL() {
   if (sync_handle_ != INVALID_HANDLE_VALUE) {
     CloseHandle(sync_handle_);
     sync_handle_ = INVALID_HANDLE_VALUE;
+  }
+#else
+  if (sync_fd_ >= 0) {
+    ::close(sync_fd_);
+    sync_fd_ = -1;
   }
 #endif
 }
@@ -261,18 +306,13 @@ Status WAL::Append(uint64_t txn_id, WALRecordType type, std::string_view payload
 
 Status WAL::Sync() {
   std::scoped_lock lk(mu_);
-  ofs_.flush();
-  if (!ofs_) {
-    return Status::IOError("WAL flush failed");
-  }
+  return DurableFileSync(&ofs_
 #ifdef _WIN32
-  if (sync_handle_ != INVALID_HANDLE_VALUE) {
-    if (!FlushFileBuffers(sync_handle_)) {
-      return Status::IOError("WAL FlushFileBuffers failed");
-    }
-  }
+                         , sync_handle_
+#else
+                         , sync_fd_
 #endif
-  return Status::OK();
+  );
 }
 
 Status WAL::AppendSync(uint64_t txn_id, WALRecordType type, std::string_view payload) {
@@ -334,6 +374,12 @@ Status WAL::Truncate() {
       OPEN_EXISTING,
       FILE_ATTRIBUTE_NORMAL,
       nullptr);
+#else
+  if (sync_fd_ >= 0) {
+    ::close(sync_fd_);
+    sync_fd_ = -1;
+  }
+  sync_fd_ = ::open(path_.c_str(), O_WRONLY);
 #endif
   return Status::OK();
 }

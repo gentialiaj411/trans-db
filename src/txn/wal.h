@@ -20,6 +20,8 @@
 #endif
 #include <windows.h>
 #undef DELETE  // windows.h defines DELETE as 0x00010000L; conflicts with WALRecordType::DELETE
+#else
+using WalSyncFd = int;
 #endif
 
 namespace txndb {
@@ -111,6 +113,8 @@ private:
   std::ofstream ofs_;
 #ifdef _WIN32
   HANDLE sync_handle_{INVALID_HANDLE_VALUE};
+#else
+  WalSyncFd sync_fd_{-1};
 #endif
   uint64_t next_lsn_{1};
 };

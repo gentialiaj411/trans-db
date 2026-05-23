@@ -2,11 +2,13 @@
 
 #include "shard/shard_server.h"
 #include "coordinator/coordinator.h"
+#include "txn/wal.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <random>
@@ -14,6 +16,12 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 using namespace txndb;
@@ -25,6 +33,12 @@ std::string UniqueBase() {
       fs::temp_directory_path() / ("trans_db_fault_" + std::to_string(std::rand()));
   fs::create_directories(base);
   return base.string();
+}
+
+std::string UniqueWalPath(std::string_view tag) {
+  const auto p = fs::temp_directory_path() /
+                 ("trans_db_wal_fault_" + std::string(tag) + "_" + std::to_string(std::rand()) + ".wal");
+  return p.string();
 }
 
 void Cleanup(const std::string& path) {
@@ -75,9 +89,14 @@ class FaultTest : public ::testing::Test {
 protected:
   void SetUp() override {
     std::srand(static_cast<unsigned>(std::chrono::steady_clock::now().time_since_epoch().count()));
-    base_dir_ = UniqueBase();
-    base_port_ = 59051 + (std::rand() % 1000);
-    StartCluster();
+    const auto* ti = ::testing::UnitTest::GetInstance()->current_test_info();
+    const std::string test_name = ti ? ti->name() : "";
+    const bool is_wal_test = test_name.rfind("WAL", 0) == 0;
+    if (!is_wal_test) {
+      base_dir_ = UniqueBase();
+      base_port_ = 10000 + (std::rand() % 50000);
+      StartCluster();
+    }
   }
 
   void TearDown() override {
@@ -208,6 +227,77 @@ TEST_F(FaultTest, AbortedDataNotVisibleAfterRestart) {
 
 TEST_F(FaultTest, SingleReplicaFailureNoDataLoss) {
   GTEST_SKIP() << "ShardServer does not expose replica-level disconnect/kill API; skipping.";
+}
+
+TEST_F(FaultTest, WALPowerLossDurability) {
+  const std::string path = UniqueWalPath("powerloss");
+  Cleanup(path);
+  constexpr int kRecords = 1000;
+#ifdef _WIN32
+  GTEST_SKIP() << "Windows limitation: test requires fork()+_exit(0) kill-style child exit semantics.";
+#else
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    std::unique_ptr<WAL> wal;
+    if (!WAL::Open(path, &wal).ok()) {
+      _exit(2);
+    }
+    for (int i = 0; i < kRecords; ++i) {
+      const auto payload = WAL::SerializeWritePayload(1, "k" + std::to_string(i),
+                                                      "v" + std::to_string(i), i + 1);
+      if (!wal->AppendSync(42, WALRecordType::WRITE, payload).ok()) {
+        _exit(3);
+      }
+    }
+    _exit(0);
+  }
+
+  int status = 0;
+  ASSERT_EQ(::waitpid(pid, &status, 0), pid);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0);
+
+  std::unique_ptr<WAL> wal2;
+  ASSERT_TRUE(WAL::Open(path, &wal2).ok());
+  int count = 0;
+  ASSERT_TRUE(wal2->Replay([&](const WALRecord& r) {
+    if (r.type == WALRecordType::WRITE) {
+      ++count;
+    }
+  }).ok());
+  EXPECT_EQ(count, kRecords);
+#endif
+  Cleanup(path);
+}
+
+TEST_F(FaultTest, WALTornWriteSurvival) {
+  const std::string path = UniqueWalPath("torn");
+  Cleanup(path);
+  constexpr int kRecords = 50;
+
+  {
+    std::unique_ptr<WAL> wal;
+    ASSERT_TRUE(WAL::Open(path, &wal).ok());
+    for (int i = 0; i < kRecords; ++i) {
+      const auto payload = WAL::SerializeWritePayload(1, "k" + std::to_string(i),
+                                                      "v" + std::to_string(i), i + 1);
+      ASSERT_TRUE(wal->AppendSync(77, WALRecordType::WRITE, payload).ok());
+    }
+  }
+
+  const auto sz = fs::file_size(path);
+  ASSERT_GT(sz, 8u);
+  std::error_code ec;
+  fs::resize_file(path, sz - 7, ec);
+  ASSERT_FALSE(ec);
+
+  std::unique_ptr<WAL> wal2;
+  ASSERT_TRUE(WAL::Open(path, &wal2).ok());
+  int count = 0;
+  ASSERT_TRUE(wal2->Replay([&](const WALRecord&) { ++count; }).ok());
+  EXPECT_EQ(count, kRecords - 1);
+  Cleanup(path);
 }
 
 TEST_F(FaultTest, MultiShardCommitAtomicity) {
