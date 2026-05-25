@@ -33,7 +33,9 @@ class Coordinator {
 public:
   Coordinator(const std::unordered_map<uint32_t, std::string>& shard_addresses,
               uint32_t num_shards,
-              std::string coordinator_log_path = {});
+              std::string coordinator_log_path = {},
+              std::unordered_map<uint32_t, std::vector<std::string>> shard_replica_addresses =
+                  {});
   ~Coordinator() = default;
 
   uint64_t Begin();
@@ -53,15 +55,33 @@ public:
 
   Status Abort(uint64_t txn_id);
   Status Recover();
+  uint32_t DebugRouteShard(std::string_view key) const { return RouteShard(key); }
+  uint32_t NumShards() const { return num_shards_; }
+
+  Status DistributedJoinOnShard(uint32_t shard_id, const DistributedJoinRequest& req,
+                                DistributedJoinResponse* resp);
 
 private:
   static constexpr auto kGrpcTimeout = std::chrono::seconds(5);
+  static constexpr size_t kLeaderRetryAttempts = 60;
+  static constexpr auto kLeaderRetrySleep = std::chrono::milliseconds(50);
 
   uint32_t RouteShard(std::string_view key) const;
 
   Status EnsureShardParticipant(CoordinatorTxn& txn, uint32_t shard_id);
 
   ShardService::Stub* GetStub(uint32_t shard_id);
+  void RotateStub(uint32_t shard_id);
+  static bool IsLeaderUnavailableMessage(std::string_view message);
+  bool RpcExecuteOnShard(uint32_t shard_id, const ExecuteRequest& req, ExecuteResponse* resp);
+  Status ExecuteWithLeaderRetry(uint32_t shard_id, const ExecuteRequest& req, ExecuteResponse* resp,
+                                std::string* value_out = nullptr);
+  bool PrepareOnShard(uint32_t shard_id, const PrepareRequest& req, PrepareResponse* resp);
+  bool CommitOnShard(uint32_t shard_id, const CommitRequest& req, CommitResponse* resp);
+  bool AbortOnShard(uint32_t shard_id, const AbortRequest& req, AbortResponse* resp);
+  bool QueryTxnStateOnShard(uint32_t shard_id, const TxnStateRequest& req, TxnStateResponse* resp);
+  bool RpcDistributedJoinOnShard(uint32_t shard_id, const DistributedJoinRequest& req,
+                               DistributedJoinResponse* resp);
 
   Status TwoPhaseCommit(uint64_t raft_txn_id, std::vector<uint32_t> participant_shards,
                         uint64_t commit_ts);
@@ -71,6 +91,9 @@ private:
   static void ApplyDeadline(grpc::ClientContext* ctx);
   Status AppendCoordinatorRecord(CoordinatorLogRecordType type, uint64_t txn_id,
                                  const std::vector<uint32_t>& shards = {});
+  Status AppendCoordinatorRecordWrite(CoordinatorLogRecordType type, uint64_t txn_id,
+                                      const std::vector<uint32_t>& shards = {});
+  Status FlushCoordinatorLog();
   Status DriveCommit(uint64_t txn_id, const std::vector<uint32_t>& shards);
   Status DriveAbort(uint64_t txn_id, const std::vector<uint32_t>& shards);
   TxnStateCode QueryShardTxnState(uint32_t shard_id, uint64_t txn_id);
@@ -84,6 +107,9 @@ private:
 
   std::unordered_map<uint32_t, std::shared_ptr<grpc::Channel>> channels_;
   std::unordered_map<uint32_t, std::unique_ptr<ShardService::Stub>> stubs_;
+  std::unordered_map<uint32_t, std::vector<std::shared_ptr<grpc::Channel>>> replica_channels_;
+  std::unordered_map<uint32_t, std::vector<std::unique_ptr<ShardService::Stub>>> replica_stubs_;
+  std::unordered_map<uint32_t, size_t> active_replica_index_;
   std::unique_ptr<CoordinatorLog> coordinator_log_;
 };
 

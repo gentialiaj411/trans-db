@@ -1,0 +1,4 @@
+{"time_us": 1, "process": 0, "type": "invoke", "f": "write", "value": ["0", "900"]}
+{"time_us": 2, "process": 0, "type": "ok", "f": "write", "value": ["0", "900"]}
+{"time_us": 3, "process": 0, "type": "invoke", "f": "read", "value": ["0"]}
+{"time_us": 4, "process": 0, "type": "ok", "f": "read", "value": ["0", "900"]}

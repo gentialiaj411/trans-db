@@ -84,8 +84,32 @@ Parser::Token::Type Parser::ClassifyKeyword(std::string_view u) {
   if (u == "FROM") {
     return Token::KW_FROM;
   }
+  if (u == "JOIN") {
+    return Token::KW_JOIN;
+  }
+  if (u == "INNER") {
+    return Token::KW_INNER;
+  }
+  if (u == "ON") {
+    return Token::KW_ON;
+  }
   if (u == "WHERE") {
     return Token::KW_WHERE;
+  }
+  if (u == "ORDER") {
+    return Token::KW_ORDER;
+  }
+  if (u == "BY") {
+    return Token::KW_BY;
+  }
+  if (u == "LIMIT") {
+    return Token::KW_LIMIT;
+  }
+  if (u == "ASC") {
+    return Token::KW_ASC;
+  }
+  if (u == "DESC") {
+    return Token::KW_DESC;
   }
   if (u == "UPDATE") {
     return Token::KW_UPDATE;
@@ -134,6 +158,18 @@ Parser::Token::Type Parser::ClassifyKeyword(std::string_view u) {
   }
   if (u == "ABORT") {
     return Token::KW_ABORT;
+  }
+  if (u == "COUNT") {
+    return Token::KW_COUNT;
+  }
+  if (u == "SUM") {
+    return Token::KW_SUM;
+  }
+  if (u == "MIN") {
+    return Token::KW_MIN;
+  }
+  if (u == "MAX") {
+    return Token::KW_MAX;
   }
   return Token::IDENT;
 }
@@ -443,7 +479,7 @@ WhereClause Parser::ParseWhere() {
 
 CompareExpr Parser::ParseCompare() {
   CompareExpr ex;
-  ex.column.name = Expect(Token::IDENT).value;
+  ex.column.name = ParseColumnRef();
   const Token pop = Peek();
   if (pop.type == Token::EQ) {
     Advance();
@@ -468,6 +504,15 @@ CompareExpr Parser::ParseCompare() {
   }
   ex.value = ParseLiteral();
   return ex;
+}
+
+std::string Parser::ParseColumnRef() {
+  std::string out = Expect(Token::IDENT).value;
+  while (Match(Token::DOT)) {
+    out.append(".");
+    out.append(Expect(Token::IDENT).value);
+  }
+  return out;
 }
 
 LiteralExpr Parser::ParseLiteral() {
@@ -503,17 +548,83 @@ SelectStmt Parser::ParseSelect() {
   Expect(Token::KW_SELECT);
   SelectStmt st;
   if (Match(Token::STAR)) {
-    // leave columns empty
+    st.select_all = true;
   } else {
-    st.columns.push_back(Expect(Token::IDENT).value);
+    auto parse_select_item = [&]() {
+      Token t = Peek();
+      if (t.type == Token::KW_COUNT || t.type == Token::KW_SUM || t.type == Token::KW_MIN ||
+          t.type == Token::KW_MAX) {
+        Advance();
+        SelectStmt::Aggregate agg;
+        if (t.type == Token::KW_COUNT) {
+          agg.func = SelectStmt::Aggregate::Func::COUNT;
+        } else if (t.type == Token::KW_SUM) {
+          agg.func = SelectStmt::Aggregate::Func::SUM;
+        } else if (t.type == Token::KW_MIN) {
+          agg.func = SelectStmt::Aggregate::Func::MIN;
+        } else {
+          agg.func = SelectStmt::Aggregate::Func::MAX;
+        }
+        Expect(Token::LPAREN);
+        if (Match(Token::STAR)) {
+          agg.star = true;
+        } else {
+          agg.column = ParseColumnRef();
+        }
+        Expect(Token::RPAREN);
+        st.aggregates.push_back(std::move(agg));
+      } else {
+        st.columns.push_back(ParseColumnRef());
+      }
+    };
+    parse_select_item();
     while (Match(Token::COMMA)) {
-      st.columns.push_back(Expect(Token::IDENT).value);
+      parse_select_item();
     }
   }
   Expect(Token::KW_FROM);
-  st.table_name = Expect(Token::IDENT).value;
-  Expect(Token::KW_WHERE);
-  st.where = ParseWhere();
+  st.table_name = ParseColumnRef();
+  if (Match(Token::KW_INNER)) {
+    Expect(Token::KW_JOIN);
+    SelectStmt::JoinClause jc;
+    jc.table_name = ParseColumnRef();
+    Expect(Token::KW_ON);
+    jc.left_column = ParseColumnRef();
+    Expect(Token::EQ);
+    jc.right_column = ParseColumnRef();
+    st.join = std::move(jc);
+  } else if (Match(Token::KW_JOIN)) {
+    SelectStmt::JoinClause jc;
+    jc.table_name = ParseColumnRef();
+    Expect(Token::KW_ON);
+    jc.left_column = ParseColumnRef();
+    Expect(Token::EQ);
+    jc.right_column = ParseColumnRef();
+    st.join = std::move(jc);
+  }
+  if (Match(Token::KW_WHERE)) {
+    st.where = ParseWhere();
+    st.has_where = true;
+  }
+  if (Match(Token::KW_ORDER)) {
+    Expect(Token::KW_BY);
+    st.order_by_column = ParseColumnRef();
+    st.has_order_by = true;
+    if (Match(Token::KW_DESC)) {
+      st.order_desc = true;
+    } else {
+      (void)Match(Token::KW_ASC);
+    }
+  }
+  if (Match(Token::KW_LIMIT)) {
+    Token lim = Expect(Token::NUMBER_INT);
+    int64_t v = 0;
+    if (!ParseInt64(lim.value, &v) || v < 0) {
+      throw ParseError{"expected non-negative LIMIT integer", lim.pos};
+    }
+    st.limit = static_cast<uint64_t>(v);
+    st.has_limit = true;
+  }
   return st;
 }
 

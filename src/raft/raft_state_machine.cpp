@@ -102,6 +102,12 @@ uint64_t RaftStateMachine::GetLocalTxnId(uint64_t raft_txn_id) const {
   return it != txn_id_map_.end() ? it->second : 0;
 }
 
+bool RaftStateMachine::IsTxnPrepared(uint64_t raft_txn_id) const {
+  std::scoped_lock lk(mu_);
+  const auto it = prepare_results_.find(raft_txn_id);
+  return it != prepare_results_.end() && it->second.success;
+}
+
 std::optional<PrepareResult> RaftStateMachine::TakePrepareResult(uint64_t raft_txn_id) {
   std::scoped_lock lk(mu_);
   auto it = prepare_results_.find(raft_txn_id);

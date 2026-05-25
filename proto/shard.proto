@@ -7,6 +7,9 @@ service ShardService {
     rpc Commit(CommitRequest) returns (CommitResponse);
     rpc Abort(AbortRequest) returns (AbortResponse);
     rpc QueryTxnState(TxnStateRequest) returns (TxnStateResponse);
+    rpc DistributedJoin(DistributedJoinRequest) returns (DistributedJoinResponse);
+    // Test-only: simulate Raft network partition to a peer replica in this shard.
+    rpc SetRaftPeerPartition(SetRaftPeerPartitionRequest) returns (SetRaftPeerPartitionResponse);
 }
 
 enum OpType {
@@ -86,4 +89,55 @@ message TxnStateRequest {
 message TxnStateResponse {
     bool ok = 1;
     TxnStateCode state = 2;
+}
+
+message SetRaftPeerPartitionRequest {
+    uint32 peer_replica_id = 1;
+    bool partitioned = 2;
+}
+
+message SetRaftPeerPartitionResponse {
+    bool ok = 1;
+}
+
+enum JoinPhysicalOp {
+    JOIN_OP_BROADCAST = 0;
+    JOIN_OP_SHUFFLE = 1;
+}
+
+message JoinRowPayload {
+    bytes row_bytes = 1;
+    string join_key = 2;
+}
+
+message JoinOutputColumn {
+    string name = 1;
+    string value = 2;
+}
+
+message JoinOutputRow {
+    repeated JoinOutputColumn columns = 1;
+}
+
+message DistributedJoinRequest {
+    uint64 raft_txn_id = 1;
+    JoinPhysicalOp op = 2;
+    uint32 build_table_id = 3;
+    uint32 probe_table_id = 4;
+    string build_join_col = 5;
+    string probe_join_col = 6;
+    repeated JoinRowPayload broadcast_build_rows = 7;
+    repeated JoinRowPayload shuffle_build_rows = 8;
+    repeated JoinRowPayload shuffle_probe_rows = 9;
+    repeated string build_column_names = 10;
+    repeated string probe_column_names = 11;
+    string build_table_name = 12;
+    string probe_table_name = 13;
+}
+
+message DistributedJoinResponse {
+    bool ok = 1;
+    uint32 error_code = 2;
+    string error_message = 3;
+    repeated JoinOutputRow rows = 4;
 }

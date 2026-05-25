@@ -1,10 +1,22 @@
 #pragma once
 
 #include <cstdint>
+#include <fstream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace txndb {
 
@@ -47,12 +59,20 @@ public:
 
 private:
   void Load();
+  bool EnsureAppendFileOpen();
   bool AppendEntryToFile(const RaftLogEntry& entry);
-  bool RewriteFileFromMemory() const;
+  bool SyncFileLocked();
+  bool RewriteFileFromMemory();
 
   mutable std::mutex mu_;
   std::vector<RaftLogEntry> entries_;
   std::string path_;
+  std::ofstream ofs_;
+#ifdef _WIN32
+  HANDLE sync_handle_{INVALID_HANDLE_VALUE};
+#else
+  int sync_fd_{-1};
+#endif
 };
 
 }  // namespace txndb

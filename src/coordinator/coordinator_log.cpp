@@ -1,4 +1,5 @@
 #include "coordinator/coordinator_log.h"
+#include "txn/group_commit.h"
 
 #include <array>
 #include <cstring>
@@ -151,12 +152,7 @@ Status CoordinatorLog::WriteRecord(const CoordinatorLogRecord& record) {
   return Status::OK();
 }
 
-Status CoordinatorLog::Append(const CoordinatorLogRecord& record) {
-  std::scoped_lock lk(mu_);
-  Status s = WriteRecord(record);
-  if (!s.ok()) {
-    return s;
-  }
+Status CoordinatorLog::SyncLocked() {
   return DurableFileSync(&ofs_
 #ifdef _WIN32
                          , sync_handle_
@@ -164,6 +160,26 @@ Status CoordinatorLog::Append(const CoordinatorLogRecord& record) {
                          , sync_fd_
 #endif
   );
+}
+
+Status CoordinatorLog::AppendWrite(const CoordinatorLogRecord& record) {
+  std::scoped_lock lk(mu_);
+  return WriteRecord(record);
+}
+
+Status CoordinatorLog::Flush() {
+  return DurableSyncRegistry::Instance().QueueSync(this, [this]() {
+    std::scoped_lock lk(mu_);
+    return SyncLocked();
+  });
+}
+
+Status CoordinatorLog::Append(const CoordinatorLogRecord& record) {
+  Status ws = AppendWrite(record);
+  if (!ws.ok()) {
+    return ws;
+  }
+  return Flush();
 }
 
 Status CoordinatorLog::Replay(const std::function<void(const CoordinatorLogRecord&)>& visitor) {

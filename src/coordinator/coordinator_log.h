@@ -46,11 +46,14 @@ public:
   CoordinatorLog& operator=(CoordinatorLog&&) = delete;
 
   Status Append(const CoordinatorLogRecord& record);
+  Status AppendWrite(const CoordinatorLogRecord& record);
+  Status Flush();
   Status Replay(const std::function<void(const CoordinatorLogRecord&)>& visitor);
 
 private:
   CoordinatorLog() = default;
   Status WriteRecord(const CoordinatorLogRecord& record);
+  Status SyncLocked();
 
   std::mutex mu_;
   std::string path_;

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include <variant>
@@ -133,6 +134,14 @@ const ColumnDef* LookupColumn(const TableDef& table, std::string_view name) {
     }
   }
   return nullptr;
+}
+
+std::string UnqualifyName(std::string_view name) {
+  const size_t dot = name.rfind('.');
+  if (dot == std::string_view::npos) {
+    return std::string(name);
+  }
+  return std::string(name.substr(dot + 1));
 }
 
 }  // namespace
@@ -671,21 +680,75 @@ void PgSession::EmitSuccess(const Statement& stmt, const ExecResult& res) {
     return;
   }
 
-  const auto emit_select_shapes = [&](const SelectStmt& sel, const ExecResult& r) -> bool {
-    const TableDef* td = catalog_->GetTable(sel.table_name);
-    if (!td) {
+  const auto infer_select_types = [&](const SelectStmt& sel, const std::vector<std::string>& out_cols,
+                                      std::vector<ColumnType>* out_types) -> bool {
+    const TableDef* left = catalog_->GetTable(sel.table_name);
+    if (!left) {
       WriteErrorResponse("ERROR", "XX000", "unknown table");
       return false;
     }
-    std::vector<ColumnType> types;
-    types.reserve(r.columns.size());
-    for (const std::string& cn : r.columns) {
-      const ColumnDef* cd = LookupColumn(*td, cn);
-      if (!cd) {
-        WriteErrorResponse("ERROR", "XX000", "unknown column");
+    const TableDef* right = nullptr;
+    if (sel.join.has_value()) {
+      right = catalog_->GetTable(sel.join->table_name);
+      if (!right) {
+        WriteErrorResponse("ERROR", "XX000", "unknown table");
         return false;
       }
-      types.push_back(cd->type);
+    }
+
+    const auto resolve_col = [&](std::string_view raw) -> std::optional<ColumnType> {
+      const std::string unq = UnqualifyName(raw);
+      if (const ColumnDef* c = LookupColumn(*left, raw)) {
+        return c->type;
+      }
+      if (const ColumnDef* c = LookupColumn(*left, unq)) {
+        return c->type;
+      }
+      if (right != nullptr) {
+        if (const ColumnDef* c = LookupColumn(*right, raw)) {
+          return c->type;
+        }
+        if (const ColumnDef* c = LookupColumn(*right, unq)) {
+          return c->type;
+        }
+      }
+      return std::nullopt;
+    };
+
+    out_types->clear();
+    out_types->reserve(out_cols.size());
+
+    if (!sel.aggregates.empty()) {
+      size_t agg_ix = 0;
+      for (size_t i = 0; i < out_cols.size(); ++i) {
+        if (i < sel.columns.size()) {
+          std::optional<ColumnType> ty = resolve_col(sel.columns[i]);
+          out_types->push_back(ty.value_or(ColumnType::VARCHAR));
+          continue;
+        }
+        const auto& agg = sel.aggregates[agg_ix++];
+        if (agg.func == SelectStmt::Aggregate::Func::COUNT) {
+          out_types->push_back(ColumnType::BIGINT);
+          continue;
+        }
+        std::optional<ColumnType> ty = agg.star ? std::optional<ColumnType>(ColumnType::BIGINT)
+                                                : resolve_col(agg.column);
+        out_types->push_back(ty.value_or(ColumnType::VARCHAR));
+      }
+      return true;
+    }
+
+    for (const std::string& out_col : out_cols) {
+      std::optional<ColumnType> ty = resolve_col(out_col);
+      out_types->push_back(ty.value_or(ColumnType::VARCHAR));
+    }
+    return true;
+  };
+
+  const auto emit_select_shapes = [&](const SelectStmt& sel, const ExecResult& r) -> bool {
+    std::vector<ColumnType> types;
+    if (!infer_select_types(sel, r.columns, &types)) {
+      return false;
     }
     WriteRowDescription(r.columns, types);
     for (const auto& rr : r.rows) {
@@ -908,30 +971,62 @@ bool PgSession::DescribeSelectMeta(const std::string& query,
   if (!sel) {
     return false;
   }
-  const TableDef* td = catalog_->GetTable(sel->table_name);
-  if (!td) {
+  Executor::ExecOutput out = const_cast<PgSession*>(this)->executor_.Execute(stmt, current_txn_id_);
+  if (!out.result.ok) {
+    *err_out = out.result.error.empty() ? "execute failed" : out.result.error;
+    return false;
+  }
+  *col_names = out.result.columns;
+
+  Statement parsed = std::move(stmt);
+  const auto* psel = std::get_if<SelectStmt>(&parsed);
+  if (psel == nullptr) {
+    return false;
+  }
+  col_types->clear();
+  col_types->reserve(col_names->size());
+
+  const TableDef* left = catalog_->GetTable(psel->table_name);
+  if (!left) {
     *err_out = "unknown table";
     return false;
   }
-
-  std::vector<std::string> names = sel->columns;
-  if (names.empty()) {
-    for (const auto& cd : td->columns) {
-      names.push_back(cd.name);
-    }
-  }
-
-  col_names->clear();
-  col_types->clear();
-
-  for (const std::string& cn : names) {
-    const ColumnDef* cd = LookupColumn(*td, cn);
-    if (!cd) {
-      *err_out = "unknown column";
+  const TableDef* right = nullptr;
+  if (psel->join.has_value()) {
+    right = catalog_->GetTable(psel->join->table_name);
+    if (!right) {
+      *err_out = "unknown table";
       return false;
     }
-    col_names->push_back(cn);
-    col_types->push_back(cd->type);
+  }
+  auto resolve_col = [&](std::string_view raw) -> std::optional<ColumnType> {
+    const std::string unq = UnqualifyName(raw);
+    if (const ColumnDef* c = LookupColumn(*left, raw)) return c->type;
+    if (const ColumnDef* c = LookupColumn(*left, unq)) return c->type;
+    if (right != nullptr) {
+      if (const ColumnDef* c = LookupColumn(*right, raw)) return c->type;
+      if (const ColumnDef* c = LookupColumn(*right, unq)) return c->type;
+    }
+    return std::nullopt;
+  };
+  if (!psel->aggregates.empty()) {
+    size_t agg_ix = 0;
+    for (size_t i = 0; i < col_names->size(); ++i) {
+      if (i < psel->columns.size()) {
+        col_types->push_back(resolve_col(psel->columns[i]).value_or(ColumnType::VARCHAR));
+      } else {
+        const auto& agg = psel->aggregates[agg_ix++];
+        if (agg.func == SelectStmt::Aggregate::Func::COUNT) {
+          col_types->push_back(ColumnType::BIGINT);
+        } else {
+          col_types->push_back(resolve_col(agg.column).value_or(ColumnType::VARCHAR));
+        }
+      }
+    }
+  } else {
+    for (const std::string& n : *col_names) {
+      col_types->push_back(resolve_col(n).value_or(ColumnType::VARCHAR));
+    }
   }
   return true;
 }

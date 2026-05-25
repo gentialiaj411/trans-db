@@ -1,4 +1,5 @@
 #include "txn/wal.h"
+#include "txn/group_commit.h"
 
 #include <algorithm>
 #include <array>
@@ -316,11 +317,15 @@ Status WAL::Sync() {
 }
 
 Status WAL::AppendSync(uint64_t txn_id, WALRecordType type, std::string_view payload) {
-  Status s = Append(txn_id, type, payload);
-  if (!s.ok()) {
-    return s;
+  {
+    std::scoped_lock lk(mu_);
+    const uint64_t lsn = next_lsn_++;
+    Status s = WriteRecord(lsn, txn_id, type, payload);
+    if (!s.ok()) {
+      return s;
+    }
   }
-  return Sync();
+  return DurableSyncRegistry::Instance().QueueSync(this, [this]() { return Sync(); });
 }
 
 Status WAL::Replay(std::function<void(const WALRecord&)> visitor) {

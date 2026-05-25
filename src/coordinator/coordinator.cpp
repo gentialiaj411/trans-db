@@ -5,6 +5,8 @@
 #include <filesystem>
 #include <future>
 #include <stdexcept>
+#include <string_view>
+#include <thread>
 
 namespace txndb {
 
@@ -35,9 +37,15 @@ void Coordinator::ApplyDeadline(grpc::ClientContext* ctx) {
   ctx->set_deadline(deadline);
 }
 
+bool Coordinator::IsLeaderUnavailableMessage(std::string_view message) {
+  return message.find("no raft leader") != std::string_view::npos ||
+         message.find("no leader") != std::string_view::npos;
+}
+
 Coordinator::Coordinator(const std::unordered_map<uint32_t, std::string>& shard_addresses,
-                         uint32_t num_shards,
-                         std::string coordinator_log_path)
+                         uint32_t num_shards, std::string coordinator_log_path,
+                         std::unordered_map<uint32_t, std::vector<std::string>>
+                             shard_replica_addresses)
     : num_shards_(num_shards) {
   if (coordinator_log_path.empty()) {
     coordinator_log_path = (std::filesystem::temp_directory_path() / "trans_db_coordinator.log").string();
@@ -54,6 +62,24 @@ Coordinator::Coordinator(const std::unordered_map<uint32_t, std::string>& shard_
         grpc::CreateCustomChannel(addr, grpc::InsecureChannelCredentials(), MakeChannelArgs());
     channels_[id] = std::move(ch);
     stubs_[id] = ShardService::NewStub(channels_[id]);
+    active_replica_index_[id] = 0;
+  }
+
+  for (auto& [id, addrs] : shard_replica_addresses) {
+    if (id >= num_shards || addrs.empty()) {
+      continue;
+    }
+    auto& chans = replica_channels_[id];
+    auto& stubs = replica_stubs_[id];
+    chans.reserve(addrs.size());
+    stubs.reserve(addrs.size());
+    for (const auto& addr : addrs) {
+      auto ch =
+          grpc::CreateCustomChannel(addr, grpc::InsecureChannelCredentials(), MakeChannelArgs());
+      chans.push_back(std::move(ch));
+      stubs.push_back(ShardService::NewStub(chans.back()));
+    }
+    active_replica_index_[id] = 0;
   }
   Status rs = Recover();
   if (!rs.ok()) {
@@ -73,32 +99,155 @@ uint32_t Coordinator::RouteShard(std::string_view key) const {
 }
 
 ShardService::Stub* Coordinator::GetStub(uint32_t shard_id) {
+  auto rit = replica_stubs_.find(shard_id);
+  if (rit != replica_stubs_.end() && !rit->second.empty()) {
+    const size_t idx = active_replica_index_[shard_id];
+    return rit->second[idx].get();
+  }
   auto it = stubs_.find(shard_id);
   return it != stubs_.end() ? it->second.get() : nullptr;
+}
+
+void Coordinator::RotateStub(uint32_t shard_id) {
+  auto rit = replica_stubs_.find(shard_id);
+  if (rit == replica_stubs_.end() || rit->second.size() <= 1) {
+    return;
+  }
+  size_t& idx = active_replica_index_[shard_id];
+  idx = (idx + 1) % rit->second.size();
+}
+
+bool Coordinator::RpcExecuteOnShard(uint32_t shard_id, const ExecuteRequest& req,
+                                    ExecuteResponse* resp) {
+  ShardService::Stub* stub = GetStub(shard_id);
+  if (!stub) {
+    return false;
+  }
+  grpc::ClientContext ctx;
+  ApplyDeadline(&ctx);
+  return stub->Execute(&ctx, req, resp).ok();
+}
+
+Status Coordinator::ExecuteWithLeaderRetry(uint32_t shard_id, const ExecuteRequest& req,
+                                         ExecuteResponse* resp, std::string* value_out) {
+  for (size_t a = 0; a < kLeaderRetryAttempts; ++a) {
+    if (!RpcExecuteOnShard(shard_id, req, resp)) {
+      RotateStub(shard_id);
+      std::this_thread::sleep_for(kLeaderRetrySleep);
+      continue;
+    }
+    const Status st = FromExecuteResponse(true, resp, value_out);
+    if (st.ok()) {
+      return st;
+    }
+    if (!IsLeaderUnavailableMessage(st.message())) {
+      return st;
+    }
+    RotateStub(shard_id);
+    std::this_thread::sleep_for(kLeaderRetrySleep);
+  }
+  return Status::IOError("no raft leader available on shard");
+}
+
+bool Coordinator::PrepareOnShard(uint32_t shard_id, const PrepareRequest& req,
+                                 PrepareResponse* resp) {
+  const size_t attempts =
+      replica_stubs_.count(shard_id) ? std::max<size_t>(1, replica_stubs_[shard_id].size()) : 1;
+  for (size_t a = 0; a < attempts; ++a) {
+    ShardService::Stub* stub = GetStub(shard_id);
+    if (!stub) {
+      return false;
+    }
+    grpc::ClientContext ctx;
+    ApplyDeadline(&ctx);
+    if (stub->Prepare(&ctx, req, resp).ok() && resp->vote_commit()) {
+      return true;
+    }
+    if (!resp->error_message().empty() &&
+        !IsLeaderUnavailableMessage(resp->error_message())) {
+      return false;
+    }
+    RotateStub(shard_id);
+  }
+  return false;
+}
+
+bool Coordinator::CommitOnShard(uint32_t shard_id, const CommitRequest& req,
+                                CommitResponse* resp) {
+  const size_t attempts =
+      replica_stubs_.count(shard_id) ? std::max<size_t>(1, replica_stubs_[shard_id].size()) : 1;
+  for (size_t a = 0; a < attempts; ++a) {
+    ShardService::Stub* stub = GetStub(shard_id);
+    if (!stub) {
+      return false;
+    }
+    grpc::ClientContext ctx;
+    ApplyDeadline(&ctx);
+    if (stub->Commit(&ctx, req, resp).ok() && resp->ok()) {
+      return true;
+    }
+    if (!resp->error_message().empty() &&
+        !IsLeaderUnavailableMessage(resp->error_message())) {
+      return false;
+    }
+    RotateStub(shard_id);
+  }
+  return false;
+}
+
+bool Coordinator::AbortOnShard(uint32_t shard_id, const AbortRequest& req, AbortResponse* resp) {
+  const size_t attempts =
+      replica_stubs_.count(shard_id) ? std::max<size_t>(1, replica_stubs_[shard_id].size()) : 1;
+  for (size_t a = 0; a < attempts; ++a) {
+    ShardService::Stub* stub = GetStub(shard_id);
+    if (!stub) {
+      return false;
+    }
+    grpc::ClientContext ctx;
+    ApplyDeadline(&ctx);
+    if (stub->Abort(&ctx, req, resp).ok()) {
+      return true;
+    }
+    RotateStub(shard_id);
+  }
+  return false;
+}
+
+bool Coordinator::QueryTxnStateOnShard(uint32_t shard_id, const TxnStateRequest& req,
+                                       TxnStateResponse* resp) {
+  const size_t attempts =
+      replica_stubs_.count(shard_id) ? std::max<size_t>(1, replica_stubs_[shard_id].size()) : 1;
+  for (size_t a = 0; a < attempts; ++a) {
+    ShardService::Stub* stub = GetStub(shard_id);
+    if (!stub) {
+      return false;
+    }
+    grpc::ClientContext ctx;
+    ApplyDeadline(&ctx);
+    if (stub->QueryTxnState(&ctx, req, resp).ok() && resp->ok()) {
+      return true;
+    }
+    RotateStub(shard_id);
+  }
+  return false;
 }
 
 Status Coordinator::EnsureShardParticipant(CoordinatorTxn& txn, uint32_t shard_id) {
   if (txn.participant_shards.count(shard_id)) {
     return Status::OK();
   }
-  ShardService::Stub* stub = GetStub(shard_id);
-  if (!stub) {
-    return Status::Error(StatusCode::InvalidArgument, "unknown shard id");
-  }
-  grpc::ClientContext ctx;
-  ApplyDeadline(&ctx);
+  const auto replica_count =
+      replica_stubs_.count(shard_id) ? replica_stubs_[shard_id].size() : size_t{1};
   ExecuteRequest req;
   req.set_raft_txn_id(txn.raft_txn_id);
   req.set_op(OP_BEGIN);
   req.set_snapshot_ts(txn.snapshot_ts);
   ExecuteResponse resp;
-  const bool ok = stub->Execute(&ctx, req, &resp).ok();
-  Status st = FromExecuteResponse(ok, &resp);
-  if (!st.ok()) {
-    return st;
+  const Status st = ExecuteWithLeaderRetry(shard_id, req, &resp);
+  if (st.ok()) {
+    txn.participant_shards.insert(shard_id);
   }
-  txn.participant_shards.insert(shard_id);
-  return Status::OK();
+  return st;
 }
 
 uint64_t Coordinator::Begin() {
@@ -113,8 +262,8 @@ uint64_t Coordinator::Begin() {
   return raft_txn_id;
 }
 
-Status Coordinator::AppendCoordinatorRecord(CoordinatorLogRecordType type, uint64_t txn_id,
-                                            const std::vector<uint32_t>& shards) {
+Status Coordinator::AppendCoordinatorRecordWrite(CoordinatorLogRecordType type, uint64_t txn_id,
+                                                 const std::vector<uint32_t>& shards) {
   if (!coordinator_log_) {
     return Status::IOError("coordinator log unavailable");
   }
@@ -126,20 +275,30 @@ Status Coordinator::AppendCoordinatorRecord(CoordinatorLogRecordType type, uint6
           std::chrono::system_clock::now().time_since_epoch())
           .count());
   rec.shards = shards;
-  return coordinator_log_->Append(rec);
+  return coordinator_log_->AppendWrite(rec);
+}
+
+Status Coordinator::FlushCoordinatorLog() {
+  if (!coordinator_log_) {
+    return Status::IOError("coordinator log unavailable");
+  }
+  return coordinator_log_->Flush();
+}
+
+Status Coordinator::AppendCoordinatorRecord(CoordinatorLogRecordType type, uint64_t txn_id,
+                                            const std::vector<uint32_t>& shards) {
+  Status ws = AppendCoordinatorRecordWrite(type, txn_id, shards);
+  if (!ws.ok()) {
+    return ws;
+  }
+  return FlushCoordinatorLog();
 }
 
 TxnStateCode Coordinator::QueryShardTxnState(uint32_t shard_id, uint64_t txn_id) {
-  ShardService::Stub* stub = GetStub(shard_id);
-  if (!stub) {
-    return TxnStateCode::TXN_UNKNOWN;
-  }
-  grpc::ClientContext ctx;
-  ApplyDeadline(&ctx);
   TxnStateRequest req;
   req.set_raft_txn_id(txn_id);
   TxnStateResponse resp;
-  if (!stub->QueryTxnState(&ctx, req, &resp).ok() || !resp.ok()) {
+  if (!QueryTxnStateOnShard(shard_id, req, &resp)) {
     return TxnStateCode::TXN_UNKNOWN;
   }
   return resp.state();
@@ -151,17 +310,11 @@ Status Coordinator::DriveCommit(uint64_t txn_id, const std::vector<uint32_t>& sh
   commit_futs.reserve(shards.size());
   for (uint32_t sid : shards) {
     commit_futs.push_back(std::async(std::launch::async, [this, txn_id, sid, commit_ts]() {
-      ShardService::Stub* stub = GetStub(sid);
-      if (!stub) {
-        return false;
-      }
-      grpc::ClientContext ctx;
-      ApplyDeadline(&ctx);
       CommitRequest cr;
       cr.set_raft_txn_id(txn_id);
       cr.set_commit_ts(commit_ts);
       CommitResponse cresp;
-      return stub->Commit(&ctx, cr, &cresp).ok() && cresp.ok();
+      return CommitOnShard(sid, cr, &cresp);
     }));
   }
   for (auto& f : commit_futs) {
@@ -177,16 +330,10 @@ Status Coordinator::DriveAbort(uint64_t txn_id, const std::vector<uint32_t>& sha
   abort_futs.reserve(shards.size());
   for (uint32_t sid : shards) {
     abort_futs.push_back(std::async(std::launch::async, [this, txn_id, sid]() {
-      ShardService::Stub* stub = GetStub(sid);
-      if (!stub) {
-        return;
-      }
-      grpc::ClientContext ctx;
-      ApplyDeadline(&ctx);
       AbortRequest ar;
       ar.set_raft_txn_id(txn_id);
       AbortResponse aresp;
-      (void)stub->Abort(&ctx, ar, &aresp).ok();
+      (void)AbortOnShard(sid, ar, &aresp);
     }));
   }
   for (auto& f : abort_futs) {
@@ -353,17 +500,13 @@ Status Coordinator::Read(uint64_t txn_id, uint32_t table_id, std::string_view ke
     return es;
   }
 
-  ShardService::Stub* stub = GetStub(shard_id);
-  grpc::ClientContext ctx;
-  ApplyDeadline(&ctx);
   ExecuteRequest req;
   req.set_raft_txn_id(txn->raft_txn_id);
   req.set_op(OP_READ);
   req.set_table_id(table_id);
   req.set_key(key.data(), key.size());
   ExecuteResponse resp;
-  const bool grpc_ok = stub->Execute(&ctx, req, &resp).ok();
-  return FromExecuteResponse(grpc_ok, &resp, value);
+  return ExecuteWithLeaderRetry(shard_id, req, &resp, value);
 }
 
 Status Coordinator::Write(uint64_t txn_id, uint32_t table_id, std::string_view key,
@@ -386,9 +529,6 @@ Status Coordinator::Write(uint64_t txn_id, uint32_t table_id, std::string_view k
     return es;
   }
 
-  ShardService::Stub* stub = GetStub(shard_id);
-  grpc::ClientContext ctx;
-  ApplyDeadline(&ctx);
   ExecuteRequest req;
   req.set_raft_txn_id(txn->raft_txn_id);
   req.set_op(OP_WRITE);
@@ -396,8 +536,7 @@ Status Coordinator::Write(uint64_t txn_id, uint32_t table_id, std::string_view k
   req.set_key(key.data(), key.size());
   req.set_value(value.data(), value.size());
   ExecuteResponse resp;
-  const bool grpc_ok = stub->Execute(&ctx, req, &resp).ok();
-  return FromExecuteResponse(grpc_ok, &resp);
+  return ExecuteWithLeaderRetry(shard_id, req, &resp);
 }
 
 Status Coordinator::Delete(uint64_t txn_id, uint32_t table_id, std::string_view key) {
@@ -419,17 +558,13 @@ Status Coordinator::Delete(uint64_t txn_id, uint32_t table_id, std::string_view 
     return es;
   }
 
-  ShardService::Stub* stub = GetStub(shard_id);
-  grpc::ClientContext ctx;
-  ApplyDeadline(&ctx);
   ExecuteRequest req;
   req.set_raft_txn_id(txn->raft_txn_id);
   req.set_op(OP_DELETE);
   req.set_table_id(table_id);
   req.set_key(key.data(), key.size());
   ExecuteResponse resp;
-  const bool grpc_ok = stub->Execute(&ctx, req, &resp).ok();
-  return FromExecuteResponse(grpc_ok, &resp);
+  return ExecuteWithLeaderRetry(shard_id, req, &resp);
 }
 
 Status Coordinator::Scan(uint64_t txn_id, uint32_t table_id, std::string_view range_start_pk,
@@ -464,13 +599,6 @@ Status Coordinator::Scan(uint64_t txn_id, uint32_t table_id, std::string_view ra
   for (uint32_t sid = 0; sid < num_shards_; ++sid) {
     scan_futs.push_back(std::async(std::launch::async, [=, this]() {
       std::vector<std::pair<std::string, std::string>> shard_rows;
-      ShardService::Stub* stub = GetStub(sid);
-      if (!stub) {
-        return std::make_pair(Status::Error(StatusCode::InvalidArgument, "unknown shard id"),
-                              std::move(shard_rows));
-      }
-      grpc::ClientContext ctx;
-      ApplyDeadline(&ctx);
       ExecuteRequest req;
       req.set_raft_txn_id(txn->raft_txn_id);
       req.set_op(OP_SCAN);
@@ -479,14 +607,9 @@ Status Coordinator::Scan(uint64_t txn_id, uint32_t table_id, std::string_view ra
       req.set_range_end_exclusive(range_end_exclusive.data(), range_end_exclusive.size());
       req.set_range_end_open(range_end_open);
       ExecuteResponse resp;
-      const bool grpc_ok = stub->Execute(&ctx, req, &resp).ok();
-      if (!grpc_ok) {
-        return std::make_pair(Status::IOError("gRPC Execute failed"), std::move(shard_rows));
-      }
-      if (!resp.ok()) {
-        return std::make_pair(
-            Status::Error(static_cast<StatusCode>(resp.error_code()), resp.error_message()),
-            std::move(shard_rows));
+      const Status st = ExecuteWithLeaderRetry(sid, req, &resp);
+      if (!st.ok()) {
+        return std::make_pair(st, std::move(shard_rows));
       }
       shard_rows.reserve(static_cast<size_t>(resp.scan_rows_size()));
       for (const ScanRow& row : resp.scan_rows()) {
@@ -512,60 +635,121 @@ Status Coordinator::Scan(uint64_t txn_id, uint32_t table_id, std::string_view ra
   return Status::OK();
 }
 
+bool Coordinator::RpcDistributedJoinOnShard(uint32_t shard_id, const DistributedJoinRequest& req,
+                                            DistributedJoinResponse* resp) {
+  ShardService::Stub* stub = GetStub(shard_id);
+  if (!stub) {
+    return false;
+  }
+  grpc::ClientContext ctx;
+  ApplyDeadline(&ctx);
+  return stub->DistributedJoin(&ctx, req, resp).ok();
+}
+
+Status Coordinator::DistributedJoinOnShard(uint32_t shard_id, const DistributedJoinRequest& req,
+                                         DistributedJoinResponse* resp) {
+  resp->Clear();
+
+  std::shared_ptr<CoordinatorTxn> txn;
+  {
+    std::scoped_lock lk(mu_);
+    auto tit = txns_.find(req.raft_txn_id());
+    if (tit == txns_.end()) {
+      return Status::Error(StatusCode::InvalidArgument, "unknown txn");
+    }
+    txn = tit->second;
+  }
+  if (txn->aborted) {
+    return Status::Error(StatusCode::InvalidArgument, "txn aborted");
+  }
+  if (shard_id >= num_shards_) {
+    return Status::Error(StatusCode::InvalidArgument, "unknown shard id");
+  }
+
+  Status es = EnsureShardParticipant(*txn, shard_id);
+  if (!es.ok()) {
+    return es;
+  }
+
+  DistributedJoinRequest shard_req = req;
+  shard_req.set_raft_txn_id(txn->raft_txn_id);
+
+  for (size_t a = 0; a < kLeaderRetryAttempts; ++a) {
+    if (!RpcDistributedJoinOnShard(shard_id, shard_req, resp)) {
+      RotateStub(shard_id);
+      std::this_thread::sleep_for(kLeaderRetrySleep);
+      continue;
+    }
+    if (resp->ok()) {
+      return Status::OK();
+    }
+    if (!resp->error_message().empty() &&
+        !IsLeaderUnavailableMessage(resp->error_message())) {
+      return Status::Error(static_cast<StatusCode>(resp->error_code()), resp->error_message());
+    }
+    RotateStub(shard_id);
+    std::this_thread::sleep_for(kLeaderRetrySleep);
+  }
+  return Status::IOError("no raft leader available on shard");
+}
+
 Status Coordinator::SingleShardCommit(uint64_t raft_txn_id, uint32_t shard_id,
                                      uint64_t commit_ts) {
   std::vector<uint32_t> parts{shard_id};
-  Status ls = AppendCoordinatorRecord(CoordinatorLogRecordType::PREPARING, raft_txn_id, parts);
+  Status ls = AppendCoordinatorRecordWrite(CoordinatorLogRecordType::PREPARING, raft_txn_id, parts);
   if (!ls.ok()) {
     return ls;
   }
-  ShardService::Stub* stub = GetStub(shard_id);
-  if (!stub) {
-    return Status::IOError("missing stub");
+  ls = FlushCoordinatorLog();
+  if (!ls.ok()) {
+    return ls;
   }
-  grpc::ClientContext prep_ctx;
-  ApplyDeadline(&prep_ctx);
   PrepareRequest pr;
   pr.set_raft_txn_id(raft_txn_id);
   pr.set_commit_ts(commit_ts);
   PrepareResponse presp;
-  if (!stub->Prepare(&prep_ctx, pr, &presp).ok()) {
+  if (!PrepareOnShard(shard_id, pr, &presp)) {
     return Status::IOError("Prepare RPC failed");
   }
   if (!presp.vote_commit()) {
-    Status abort_log = AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTING, raft_txn_id);
-    if (!abort_log.ok()) {
-      return abort_log;
-    }
-    grpc::ClientContext abort_ctx;
-    ApplyDeadline(&abort_ctx);
+    (void)AppendCoordinatorRecordWrite(CoordinatorLogRecordType::ABORTING, raft_txn_id);
     AbortRequest ar;
     ar.set_raft_txn_id(raft_txn_id);
     AbortResponse aresp;
-    (void)stub->Abort(&abort_ctx, ar, &aresp);
-    (void)AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTED, raft_txn_id);
+    (void)AbortOnShard(shard_id, ar, &aresp);
+    (void)AppendCoordinatorRecordWrite(CoordinatorLogRecordType::ABORTED, raft_txn_id);
+    ls = FlushCoordinatorLog();
+    if (!ls.ok()) {
+      return ls;
+    }
     return Status::Error(StatusCode::Conflict, presp.error_message());
   }
 
-  ls = AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTING, raft_txn_id);
+  ls = AppendCoordinatorRecordWrite(CoordinatorLogRecordType::COMMITTING, raft_txn_id);
   if (!ls.ok()) {
     return ls;
   }
-  grpc::ClientContext cctx;
-  ApplyDeadline(&cctx);
   CommitRequest cr;
   cr.set_raft_txn_id(raft_txn_id);
   cr.set_commit_ts(commit_ts);
   CommitResponse cresp;
-  if (!stub->Commit(&cctx, cr, &cresp).ok() || !cresp.ok()) {
+  if (!CommitOnShard(shard_id, cr, &cresp)) {
     return Status::IOError("Commit RPC failed");
   }
-  return AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTED, raft_txn_id);
+  ls = AppendCoordinatorRecordWrite(CoordinatorLogRecordType::COMMITTED, raft_txn_id);
+  if (!ls.ok()) {
+    return ls;
+  }
+  return FlushCoordinatorLog();
 }
 
 Status Coordinator::TwoPhaseCommit(uint64_t raft_txn_id, std::vector<uint32_t> parts,
                                    uint64_t commit_ts) {
-  Status ls = AppendCoordinatorRecord(CoordinatorLogRecordType::PREPARING, raft_txn_id, parts);
+  Status ls = AppendCoordinatorRecordWrite(CoordinatorLogRecordType::PREPARING, raft_txn_id, parts);
+  if (!ls.ok()) {
+    return ls;
+  }
+  ls = FlushCoordinatorLog();
   if (!ls.ok()) {
     return ls;
   }
@@ -574,15 +758,10 @@ Status Coordinator::TwoPhaseCommit(uint64_t raft_txn_id, std::vector<uint32_t> p
   for (uint32_t sid : parts) {
     prep_futs.push_back(std::async(std::launch::async, [this, raft_txn_id, sid, commit_ts]() {
       PrepareResponse presp;
-      ShardService::Stub* stub = GetStub(sid);
-      grpc::ClientContext ctx;
-      this->ApplyDeadline(&ctx);
       PrepareRequest pr;
       pr.set_raft_txn_id(raft_txn_id);
       pr.set_commit_ts(commit_ts);
-      if (stub) {
-        (void)stub->Prepare(&ctx, pr, &presp).ok();
-      }
+      (void)PrepareOnShard(sid, pr, &presp);
       return std::pair<uint32_t, PrepareResponse>{sid, std::move(presp)};
     }));
   }
@@ -598,50 +777,39 @@ Status Coordinator::TwoPhaseCommit(uint64_t raft_txn_id, std::vector<uint32_t> p
   }
 
   if (!all_vote_commit) {
-    ls = AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTING, raft_txn_id);
-    if (!ls.ok()) {
-      return ls;
-    }
+    (void)AppendCoordinatorRecordWrite(CoordinatorLogRecordType::ABORTING, raft_txn_id);
     std::vector<std::future<void>> abort_futs;
     for (uint32_t sid : parts) {
       abort_futs.push_back(std::async(std::launch::async, [this, raft_txn_id, sid]() {
-        ShardService::Stub* stub = this->GetStub(sid);
-        if (!stub) {
-          return;
-        }
-        grpc::ClientContext ctx;
-        this->ApplyDeadline(&ctx);
         AbortRequest ar;
         ar.set_raft_txn_id(raft_txn_id);
         AbortResponse aresp;
-        (void)stub->Abort(&ctx, ar, &aresp).ok();
+        (void)AbortOnShard(sid, ar, &aresp);
       }));
     }
     for (auto& f : abort_futs) {
       f.wait();
     }
-    (void)AppendCoordinatorRecord(CoordinatorLogRecordType::ABORTED, raft_txn_id);
+    (void)AppendCoordinatorRecordWrite(CoordinatorLogRecordType::ABORTED, raft_txn_id);
+    ls = FlushCoordinatorLog();
+    if (!ls.ok()) {
+      return ls;
+    }
     return Status::Error(StatusCode::Conflict, "2PC prepare failed");
   }
 
-  ls = AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTING, raft_txn_id);
+  ls = AppendCoordinatorRecordWrite(CoordinatorLogRecordType::COMMITTING, raft_txn_id);
   if (!ls.ok()) {
     return ls;
   }
   std::vector<std::future<bool>> commit_futs;
   for (uint32_t sid : parts) {
     commit_futs.push_back(std::async(std::launch::async, [this, raft_txn_id, sid, commit_ts]() {
-      ShardService::Stub* stub = this->GetStub(sid);
-      if (!stub) {
-        return false;
-      }
-      grpc::ClientContext ctx;
-      this->ApplyDeadline(&ctx);
       CommitRequest cr;
       cr.set_raft_txn_id(raft_txn_id);
       cr.set_commit_ts(commit_ts);
       CommitResponse cresp;
-      return stub->Commit(&ctx, cr, &cresp).ok() && cresp.ok();
+      return CommitOnShard(sid, cr, &cresp);
     }));
   }
   for (auto& f : commit_futs) {
@@ -649,7 +817,11 @@ Status Coordinator::TwoPhaseCommit(uint64_t raft_txn_id, std::vector<uint32_t> p
       return Status::IOError("2PC commit failed");
     }
   }
-  return AppendCoordinatorRecord(CoordinatorLogRecordType::COMMITTED, raft_txn_id);
+  ls = AppendCoordinatorRecordWrite(CoordinatorLogRecordType::COMMITTED, raft_txn_id);
+  if (!ls.ok()) {
+    return ls;
+  }
+  return FlushCoordinatorLog();
 }
 
 Status Coordinator::Commit(uint64_t txn_id) {

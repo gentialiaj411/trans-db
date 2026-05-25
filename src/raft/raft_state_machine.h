@@ -40,6 +40,7 @@ public:
   std::function<void(const RaftLogEntry& entry)> WrapApply();
 
   uint64_t GetLocalTxnId(uint64_t raft_txn_id) const;
+  bool IsTxnPrepared(uint64_t raft_txn_id) const;
   std::optional<PrepareResult> TakePrepareResult(uint64_t raft_txn_id);
   void RegisterLocalTxn(uint64_t raft_txn_id, uint64_t local_txn_id);
   void ForgetTxn(uint64_t raft_txn_id);

@@ -1,0 +1,79 @@
+﻿[
+    {
+        "ConfigId":  "gc_off_clean",
+        "GC":  "0",
+        "Coord":  null,
+        "Replica":  null,
+        "Batch":  null,
+        "Rep1Tps":  158.63,
+        "Rep2Tps":  116.41,
+        "MedianTps":  137.51999999999998,
+        "MedianP99":  460148.69999999995
+    },
+    {
+        "ConfigId":  "gc_w0_r0",
+        "GC":  "1",
+        "Coord":  "0",
+        "Replica":  "0",
+        "Batch":  "64",
+        "Rep1Tps":  63.94,
+        "Rep2Tps":  97.03,
+        "MedianTps":  80.485,
+        "MedianP99":  631259
+    },
+    {
+        "ConfigId":  "gc_w0_r50",
+        "GC":  "1",
+        "Coord":  "0",
+        "Replica":  "50",
+        "Batch":  "64",
+        "Rep1Tps":  19.22,
+        "Rep2Tps":  56.2,
+        "MedianTps":  37.71,
+        "MedianP99":  1255033.35
+    },
+    {
+        "ConfigId":  "gc_w0_r100",
+        "GC":  "1",
+        "Coord":  "0",
+        "Replica":  "100",
+        "Batch":  "64",
+        "Rep1Tps":  96.6,
+        "Rep2Tps":  21.94,
+        "MedianTps":  59.269999999999996,
+        "MedianP99":  1015881.1
+    },
+    {
+        "ConfigId":  "gc_w0_r250",
+        "GC":  "1",
+        "Coord":  "0",
+        "Replica":  "250",
+        "Batch":  "64",
+        "Rep1Tps":  53.08,
+        "Rep2Tps":  100.95,
+        "MedianTps":  77.015,
+        "MedianP99":  680653.25
+    },
+    {
+        "ConfigId":  "gc_w50_r100",
+        "GC":  "1",
+        "Coord":  "50",
+        "Replica":  "100",
+        "Batch":  "128",
+        "Rep1Tps":  45.93,
+        "Rep2Tps":  95.1,
+        "MedianTps":  70.515,
+        "MedianP99":  875024.45
+    },
+    {
+        "ConfigId":  "gc_w100_r250",
+        "GC":  "1",
+        "Coord":  "100",
+        "Replica":  "250",
+        "Batch":  "128",
+        "Rep1Tps":  19.98,
+        "Rep2Tps":  53.86,
+        "MedianTps":  36.92,
+        "MedianP99":  1534937.15
+    }
+]

@@ -1,5 +1,7 @@
 #include "coordinator/executor.h"
 
+#include "coordinator/distributed_join.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -54,6 +56,14 @@ const ColumnDef* FindColumn(const TableDef& t, std::string_view name) {
     }
   }
   return nullptr;
+}
+
+std::string BaseColName(std::string_view name) {
+  const size_t pos = name.find_last_of('.');
+  if (pos == std::string_view::npos) {
+    return std::string(name);
+  }
+  return std::string(name.substr(pos + 1));
 }
 
 int ColumnIndex(const TableDef& t, std::string_view name) {
@@ -530,6 +540,269 @@ Executor::ExecOutput Executor::ExecSelect(const SelectStmt& stmt, uint64_t txn_i
     out.result.ok = false;
     out.result.error = "unknown table";
     out.txn_id = txn_id;
+    return out;
+  }
+
+  const bool extended = stmt.join.has_value() || stmt.has_order_by || stmt.has_limit ||
+                        !stmt.aggregates.empty() || !stmt.has_where;
+  if (extended) {
+    const TableDef* right_table = nullptr;
+    if (stmt.join) {
+      right_table = catalog_->GetTable(stmt.join->table_name);
+      if (!right_table) {
+        out.result.ok = false;
+        out.result.error = "unknown JOIN table";
+        out.txn_id = txn_id;
+        return out;
+      }
+    }
+
+    auto run_extended = [&](uint64_t tid) -> Status {
+      using RowMap = std::unordered_map<std::string, std::string>;
+      std::vector<RowMap> rows;
+
+      if (right_table && stmt.join.has_value() && coordinator_->NumShards() > 1) {
+        DistributedJoinPlanner planner(coordinator_, catalog_, coordinator_->NumShards());
+        const DistributedJoinPlanner::PhysicalOp op = ParseJoinPhysicalOpFromEnv();
+        Status js = planner.ExecuteInnerJoin(stmt, *table, *right_table, tid, op, &rows);
+        if (!js.ok()) {
+          return js;
+        }
+      } else {
+        std::vector<std::pair<std::string, std::string>> left_scan;
+        Status s = coordinator_->Scan(tid, table->table_id, "", "", true, &left_scan);
+        if (!s.ok()) {
+          return s;
+        }
+
+        std::vector<std::pair<std::string, std::string>> right_scan;
+        if (right_table) {
+          s = coordinator_->Scan(tid, right_table->table_id, "", "", true, &right_scan);
+          if (!s.ok()) {
+            return s;
+          }
+        }
+
+        rows.reserve(left_scan.size());
+        for (auto& lkv : left_scan) {
+          auto lcells = DeserializeRow(*table, lkv.second);
+          if (lcells.size() != table->columns.size()) {
+            return Status::Error(StatusCode::InvalidArgument, "corrupt left row");
+          }
+          RowMap base;
+          for (size_t i = 0; i < table->columns.size(); ++i) {
+            base[table->columns[i].name] = lcells[i];
+            base[table->name + "." + table->columns[i].name] = lcells[i];
+          }
+          if (!right_table) {
+            rows.push_back(std::move(base));
+            continue;
+          }
+          for (auto& rkv : right_scan) {
+            auto rcells = DeserializeRow(*right_table, rkv.second);
+            if (rcells.size() != right_table->columns.size()) {
+              return Status::Error(StatusCode::InvalidArgument, "corrupt right row");
+            }
+            RowMap joined = base;
+            for (size_t i = 0; i < right_table->columns.size(); ++i) {
+              joined[right_table->columns[i].name] = rcells[i];
+              joined[right_table->name + "." + right_table->columns[i].name] = rcells[i];
+            }
+            auto lit = joined.find(stmt.join->left_column);
+            auto rit = joined.find(stmt.join->right_column);
+            if (lit != joined.end() && rit != joined.end() && lit->second == rit->second) {
+              rows.push_back(std::move(joined));
+            }
+          }
+        }
+      }
+
+      if (stmt.has_where) {
+        std::vector<RowMap> filtered;
+        filtered.reserve(rows.size());
+        for (auto& row : rows) {
+          bool ok = true;
+          for (const auto& c : stmt.where.conditions) {
+            auto it = row.find(c.column.name);
+            if (it == row.end()) {
+              it = row.find(BaseColName(c.column.name));
+            }
+            if (it == row.end()) {
+              ok = false;
+              break;
+            }
+            ColumnType ct = ColumnType::VARCHAR;
+            std::string bn = BaseColName(c.column.name);
+            if (const auto* col = FindColumn(*table, bn)) {
+              ct = col->type;
+            } else if (right_table) {
+              if (const auto* col2 = FindColumn(*right_table, bn)) {
+                ct = col2->type;
+              }
+            }
+            if (!CompareCell(it->second, c.op, c.value, ct)) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) {
+            filtered.push_back(std::move(row));
+          }
+        }
+        rows = std::move(filtered);
+      }
+
+      if (stmt.has_order_by) {
+        std::sort(rows.begin(), rows.end(), [&](const RowMap& a, const RowMap& b) {
+          auto av = a.find(stmt.order_by_column);
+          auto bv = b.find(stmt.order_by_column);
+          std::string as = (av != a.end()) ? av->second : "";
+          std::string bs = (bv != b.end()) ? bv->second : "";
+          if (stmt.order_desc) {
+            return as > bs;
+          }
+          return as < bs;
+        });
+      }
+
+      if (stmt.has_limit && rows.size() > stmt.limit) {
+        rows.resize(static_cast<size_t>(stmt.limit));
+      }
+
+      if (!stmt.aggregates.empty()) {
+        ResultRow rr;
+        out.result.columns.clear();
+        rr.values.reserve(stmt.aggregates.size() + stmt.columns.size());
+        for (const auto& col : stmt.columns) {
+          out.result.columns.push_back(col);
+          if (rows.empty()) {
+            rr.values.push_back("");
+          } else {
+            auto it = rows[0].find(col);
+            if (it == rows[0].end()) {
+              it = rows[0].find(BaseColName(col));
+            }
+            rr.values.push_back(it == rows[0].end() ? "" : it->second);
+          }
+        }
+        for (const auto& agg : stmt.aggregates) {
+          std::string cname = "agg";
+          if (agg.func == SelectStmt::Aggregate::Func::COUNT) cname = "count";
+          if (agg.func == SelectStmt::Aggregate::Func::SUM) cname = "sum";
+          if (agg.func == SelectStmt::Aggregate::Func::MIN) cname = "min";
+          if (agg.func == SelectStmt::Aggregate::Func::MAX) cname = "max";
+          out.result.columns.push_back(cname);
+
+          if (agg.func == SelectStmt::Aggregate::Func::COUNT) {
+            if (agg.star) {
+              rr.values.push_back(std::to_string(rows.size()));
+            } else {
+              uint64_t cnt = 0;
+              for (const auto& row : rows) {
+                auto it = row.find(agg.column);
+                if (it == row.end()) {
+                  it = row.find(BaseColName(agg.column));
+                }
+                if (it != row.end() && !it->second.empty()) {
+                  ++cnt;
+                }
+              }
+              rr.values.push_back(std::to_string(cnt));
+            }
+          } else {
+            bool have = false;
+            double sum = 0;
+            double mn = 0;
+            double mx = 0;
+            for (const auto& row : rows) {
+              auto it = row.find(agg.column);
+              if (it == row.end()) {
+                it = row.find(BaseColName(agg.column));
+              }
+              if (it == row.end()) {
+                continue;
+              }
+              double v = 0;
+              try {
+                v = std::stod(it->second);
+              } catch (...) {
+                continue;
+              }
+              if (!have) {
+                have = true;
+                mn = mx = v;
+              }
+              sum += v;
+              mn = std::min(mn, v);
+              mx = std::max(mx, v);
+            }
+            if (!have) {
+              rr.values.push_back("0");
+            } else if (agg.func == SelectStmt::Aggregate::Func::SUM) {
+              rr.values.push_back(std::to_string(sum));
+            } else if (agg.func == SelectStmt::Aggregate::Func::MIN) {
+              rr.values.push_back(std::to_string(mn));
+            } else {
+              rr.values.push_back(std::to_string(mx));
+            }
+          }
+        }
+        out.result.rows.push_back(std::move(rr));
+      } else {
+        out.result.columns.clear();
+        if (stmt.select_all || stmt.columns.empty()) {
+          for (const auto& c : table->columns) {
+            out.result.columns.push_back(c.name);
+          }
+          if (right_table) {
+            for (const auto& c : right_table->columns) {
+              out.result.columns.push_back(c.name);
+            }
+          }
+        } else {
+          out.result.columns = stmt.columns;
+        }
+        for (const auto& row : rows) {
+          ResultRow rr;
+          rr.values.reserve(out.result.columns.size());
+          for (const auto& c : out.result.columns) {
+            auto it = row.find(c);
+            if (it == row.end()) {
+              it = row.find(BaseColName(c));
+            }
+            rr.values.push_back(it == row.end() ? "" : it->second);
+          }
+          out.result.rows.push_back(std::move(rr));
+        }
+      }
+      out.result.command_tag = "SELECT " + std::to_string(out.result.rows.size());
+      return Status::OK();
+    };
+
+    if (txn_id != 0) {
+      Status st = run_extended(txn_id);
+      if (!st.ok()) {
+        out.result.ok = false;
+        out.result.error = st.message();
+      }
+      out.txn_id = txn_id;
+      return out;
+    }
+    uint64_t t = coordinator_->Begin();
+    Status st = run_extended(t);
+    if (!st.ok()) {
+      (void)coordinator_->Abort(t);
+      out.result.ok = false;
+      out.result.error = st.message();
+      out.txn_id = 0;
+      return out;
+    }
+    Status c = coordinator_->Commit(t);
+    if (!c.ok()) {
+      out.result.ok = false;
+      out.result.error = c.message();
+    }
+    out.txn_id = 0;
     return out;
   }
 

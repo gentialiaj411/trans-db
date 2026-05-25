@@ -62,8 +62,28 @@ struct InsertStmt {
 
 struct SelectStmt {
   std::string table_name;
+  struct Aggregate {
+    enum class Func { COUNT, SUM, MIN, MAX };
+    Func func{Func::COUNT};
+    std::string column;
+    bool star{false};
+  };
+  struct JoinClause {
+    std::string table_name;
+    std::string left_column;
+    std::string right_column;
+  };
   std::vector<std::string> columns;  // empty = SELECT *
+  bool select_all{false};
+  std::vector<Aggregate> aggregates;
+  std::optional<JoinClause> join;
   WhereClause where;
+  bool has_where{false};
+  bool has_order_by{false};
+  std::string order_by_column;
+  bool order_desc{false};
+  bool has_limit{false};
+  uint64_t limit{0};
 };
 
 struct UpdateStmt {
@@ -134,7 +154,15 @@ private:
       KW_VALUES,
       KW_SELECT,
       KW_FROM,
+      KW_JOIN,
+      KW_INNER,
+      KW_ON,
       KW_WHERE,
+      KW_ORDER,
+      KW_BY,
+      KW_LIMIT,
+      KW_ASC,
+      KW_DESC,
       KW_UPDATE,
       KW_SET,
       KW_DELETE,
@@ -151,6 +179,10 @@ private:
       KW_NOT,
       KW_NULL,
       KW_ABORT,
+      KW_COUNT,
+      KW_SUM,
+      KW_MIN,
+      KW_MAX,
       END_OF_INPUT,
       UNKNOWN,
     } type;
@@ -173,6 +205,7 @@ private:
   CreateTableStmt ParseCreateTable();
   InsertStmt ParseInsert();
   SelectStmt ParseSelect();
+  std::string ParseColumnRef();
   UpdateStmt ParseUpdate();
   DeleteStmt ParseDelete();
   WhereClause ParseWhere();

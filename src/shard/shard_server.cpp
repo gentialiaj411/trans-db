@@ -1,5 +1,6 @@
 #include "shard/shard_server.h"
 
+#include "shard/distributed_join_handler.h"
 #include "storage/status.h"
 
 #include <filesystem>
@@ -25,50 +26,93 @@ uint32_t ErrorCode(StatusCode c) { return static_cast<uint32_t>(c); }
 
 }  // namespace
 
+void ShardServiceImpl::InitReplica(uint32_t replica_index, uint32_t raft_node_id,
+                                   std::vector<uint32_t> peers, RaftTransport* transport,
+                                   const std::string& replica_data_path) {
+  std::error_code ec;
+  fs::create_directories(replica_data_path, ec);
+
+  auto stack = std::make_unique<ReplicaStack>();
+  const std::string rock = JoinPath(replica_data_path, "db");
+  const std::string walp = JoinPath(replica_data_path, "wal");
+  const std::string raft_dir = JoinPath(replica_data_path, "raft");
+  fs::create_directories(rock, ec);
+
+  if (!MVCCStore::Open(rock, &stack->store).ok()) {
+    throw std::runtime_error("MVCCStore::Open failed");
+  }
+  if (!WAL::Open(walp, &stack->wal).ok()) {
+    throw std::runtime_error("WAL::Open failed");
+  }
+  stack->lock_mgr = std::make_unique<LockManager>();
+  stack->txn_mgr =
+      std::make_unique<TxnManager>(stack->store.get(), stack->wal.get(), stack->lock_mgr.get());
+  if (!stack->txn_mgr->Recover().ok()) {
+    throw std::runtime_error("TxnManager::Recover failed");
+  }
+  stack->state_machine = std::make_unique<RaftStateMachine>(stack->txn_mgr.get());
+
+  stack->raft_node = std::make_unique<RaftNode>(raft_node_id, std::move(peers), transport,
+                                                stack->state_machine->WrapApply(), raft_dir);
+  if (mode_ == ShardTransportMode::InProcess) {
+    inproc_transport_.RegisterNode(raft_node_id, stack->raft_node.get());
+  }
+
+  if (replicas_.size() <= replica_index) {
+    replicas_.resize(replica_index + 1);
+  }
+  replicas_[replica_index] = std::move(stack);
+}
+
 ShardServiceImpl::ShardServiceImpl(uint32_t shard_id, const std::string& data_dir,
-                                   uint32_t num_replicas)
-    : shard_id_(shard_id), data_dir_(data_dir) {
+                                   uint32_t num_replicas, ShardTransportMode mode)
+    : shard_id_(shard_id), data_dir_(data_dir), mode_(mode) {
   std::error_code ec;
   fs::create_directories(data_dir_, ec);
+
+  if (mode_ != ShardTransportMode::InProcess) {
+    throw std::invalid_argument("multi-replica ShardServiceImpl requires InProcess mode");
+  }
 
   replicas_.reserve(num_replicas);
   std::ostringstream prefix;
   prefix << data_dir << "/shard" << shard_id << "_rep";
 
   for (uint32_t i = 0; i < num_replicas; ++i) {
-    auto stack = std::make_unique<ReplicaStack>();
-    const std::string base = prefix.str() + std::to_string(i);
-    const std::string rock = JoinPath(base, "db");
-    const std::string walp = JoinPath(base, "wal");
-    fs::create_directories(rock, ec);
-
-    if (!MVCCStore::Open(rock, &stack->store).ok()) {
-      throw std::runtime_error("MVCCStore::Open failed");
-    }
-    if (!WAL::Open(walp, &stack->wal).ok()) {
-      throw std::runtime_error("WAL::Open failed");
-    }
-    stack->lock_mgr = std::make_unique<LockManager>();
-    stack->txn_mgr =
-        std::make_unique<TxnManager>(stack->store.get(), stack->wal.get(), stack->lock_mgr.get());
-    if (!stack->txn_mgr->Recover().ok()) {
-      throw std::runtime_error("TxnManager::Recover failed");
-    }
-    stack->state_machine = std::make_unique<RaftStateMachine>(stack->txn_mgr.get());
-
     std::vector<uint32_t> peers;
     for (uint32_t j = 0; j < num_replicas; ++j) {
       if (j != i) {
         peers.push_back(j);
       }
     }
-
-    stack->raft_node = std::make_unique<RaftNode>(i, std::move(peers), &transport_,
-                                                  stack->state_machine->WrapApply());
-    transport_.RegisterNode(i, stack->raft_node.get());
-
-    replicas_.push_back(std::move(stack));
+    const std::string base = prefix.str() + std::to_string(i);
+    InitReplica(i, i, std::move(peers), &inproc_transport_, base);
   }
+}
+
+ShardServiceImpl::ShardServiceImpl(uint32_t shard_id, uint32_t replica_id,
+                                   const std::string& data_dir, GrpcRaftTransport* grpc_transport,
+                                   const std::unordered_map<uint32_t, std::string>& raft_peer_addrs)
+    : shard_id_(shard_id),
+      local_replica_id_(replica_id),
+      data_dir_(data_dir),
+      mode_(ShardTransportMode::Grpc),
+      grpc_transport_(grpc_transport) {
+  if (!grpc_transport_) {
+    throw std::invalid_argument("grpc transport required");
+  }
+  grpc_transport_->SetLocalNodeId(replica_id);
+
+  std::vector<uint32_t> peers;
+  peers.reserve(raft_peer_addrs.size());
+  for (const auto& [peer_id, addr] : raft_peer_addrs) {
+    if (peer_id != replica_id) {
+      peers.push_back(peer_id);
+      grpc_transport_->AddPeer(peer_id, addr);
+    }
+  }
+
+  InitReplica(0, replica_id, std::move(peers), grpc_transport_, data_dir_);
 }
 
 ShardServiceImpl::~ShardServiceImpl() { Stop(); }
@@ -147,14 +191,49 @@ uint32_t ShardServiceImpl::GetLeaderReplicaId() const {
 }
 
 void ShardServiceImpl::DisconnectReplicaForTest(uint32_t replica_id) {
-  transport_.DisconnectNode(replica_id);
+  if (mode_ == ShardTransportMode::InProcess) {
+    inproc_transport_.DisconnectNode(replica_id);
+    return;
+  }
+  if (grpc_transport_) {
+    grpc_transport_->DisconnectPeer(replica_id);
+  }
 }
 
 void ShardServiceImpl::ReconnectReplicaForTest(uint32_t replica_id) {
-  if (replica_id >= replicas_.size()) {
+  if (mode_ == ShardTransportMode::InProcess) {
+    if (replica_id >= replicas_.size()) {
+      return;
+    }
+    inproc_transport_.ReconnectNode(replica_id, replicas_[replica_id]->raft_node.get());
     return;
   }
-  transport_.ReconnectNode(replica_id, replicas_[replica_id]->raft_node.get());
+  if (grpc_transport_) {
+    grpc_transport_->ReconnectPeer(replica_id);
+  }
+}
+
+void ShardServiceImpl::SetRaftPeerPartitionForTest(uint32_t peer_replica_id, bool partitioned) {
+  if (partitioned) {
+    DisconnectReplicaForTest(peer_replica_id);
+  } else {
+    ReconnectReplicaForTest(peer_replica_id);
+  }
+}
+
+RaftNode* ShardServiceImpl::GetRaftNode(uint32_t replica_id) {
+  if (replica_id >= replicas_.size() || !replicas_[replica_id]) {
+    return nullptr;
+  }
+  return replicas_[replica_id]->raft_node.get();
+}
+
+grpc::Status ShardServiceImpl::SetRaftPeerPartition(
+    grpc::ServerContext* /*context*/, const SetRaftPeerPartitionRequest* request,
+    SetRaftPeerPartitionResponse* response) {
+  SetRaftPeerPartitionForTest(request->peer_replica_id(), request->partitioned());
+  response->set_ok(true);
+  return grpc::Status::OK;
 }
 
 grpc::Status ShardServiceImpl::Execute(grpc::ServerContext* /*context*/, const ExecuteRequest* request,
@@ -449,6 +528,39 @@ grpc::Status ShardServiceImpl::Abort(grpc::ServerContext* /*context*/, const Abo
   return grpc::Status::OK;
 }
 
+grpc::Status ShardServiceImpl::DistributedJoin(grpc::ServerContext* /*context*/,
+                                               const DistributedJoinRequest* request,
+                                               DistributedJoinResponse* response) {
+  ReplicaStack* L = FindLeader();
+  if (!L) {
+    response->set_ok(false);
+    response->set_error_code(ErrorCode(StatusCode::InvalidArgument));
+    response->set_error_message("no raft leader available");
+    return grpc::Status::OK;
+  }
+
+  uint64_t local = 0;
+  {
+    std::scoped_lock lk(pending_mu_);
+    auto it = pending_txns_.find(request->raft_txn_id());
+    if (it != pending_txns_.end()) {
+      local = it->second.local_txn_id;
+    }
+  }
+  if (local == 0) {
+    local = L->state_machine->GetLocalTxnId(request->raft_txn_id());
+  }
+  if (local == 0) {
+    response->set_ok(false);
+    response->set_error_code(ErrorCode(StatusCode::InvalidArgument));
+    response->set_error_message("txn not begun on shard");
+    return grpc::Status::OK;
+  }
+
+  (void)RunDistributedJoin(L->txn_mgr.get(), local, *request, response);
+  return grpc::Status::OK;
+}
+
 grpc::Status ShardServiceImpl::QueryTxnState(grpc::ServerContext* /*context*/,
                                              const TxnStateRequest* request,
                                              TxnStateResponse* response) {
@@ -468,14 +580,66 @@ grpc::Status ShardServiceImpl::QueryTxnState(grpc::ServerContext* /*context*/,
     return grpc::Status::OK;
   }
 
+  if (!replicas_.empty() && replicas_[0] && replicas_[0]->state_machine &&
+      replicas_[0]->state_machine->IsTxnPrepared(request->raft_txn_id())) {
+    response->set_ok(true);
+    response->set_state(TxnStateCode::TXN_PREPARED);
+    return grpc::Status::OK;
+  }
+
   response->set_ok(true);
   response->set_state(TxnStateCode::TXN_UNKNOWN);
   return grpc::Status::OK;
 }
 
 ShardServer::ShardServer(uint32_t shard_id, const std::string& data_dir,
-                         const std::string& listen_addr, uint32_t num_replicas)
-    : service_(shard_id, data_dir, num_replicas), listen_addr_(listen_addr) {}
+                         const std::string& listen_addr, uint32_t num_replicas,
+                         ShardTransportMode mode)
+    : service_(shard_id, data_dir, num_replicas, mode), listen_addr_(listen_addr) {}
+
+ReplicaServer::ReplicaServer(uint32_t shard_id, uint32_t replica_id, const std::string& data_dir,
+                             const std::string& shard_listen_addr,
+                             const std::string& raft_listen_addr,
+                             const std::unordered_map<uint32_t, std::string>& raft_peer_addrs)
+    : shard_service_(shard_id, replica_id, data_dir, &raft_transport_, raft_peer_addrs),
+      raft_service_(shard_service_.GetRaftNode(0)),
+      shard_listen_addr_(shard_listen_addr),
+      raft_listen_addr_(raft_listen_addr) {}
+
+ReplicaServer::~ReplicaServer() { Stop(); }
+
+void ReplicaServer::Start() {
+  shard_service_.Start();
+  grpc::ServerBuilder raft_builder;
+  raft_builder.AddListeningPort(raft_listen_addr_, grpc::InsecureServerCredentials());
+  raft_builder.RegisterService(&raft_service_);
+  raft_server_ = raft_builder.BuildAndStart();
+
+  grpc::ServerBuilder shard_builder;
+  shard_builder.AddListeningPort(shard_listen_addr_, grpc::InsecureServerCredentials());
+  shard_builder.RegisterService(&shard_service_);
+  shard_server_ = shard_builder.BuildAndStart();
+}
+
+void ReplicaServer::Stop() {
+  if (shard_server_) {
+    shard_server_->Shutdown();
+    shard_server_->Wait();
+    shard_server_.reset();
+  }
+  if (raft_server_) {
+    raft_server_->Shutdown();
+    raft_server_->Wait();
+    raft_server_.reset();
+  }
+  shard_service_.Stop();
+}
+
+void ReplicaServer::Wait() {
+  if (shard_server_) {
+    shard_server_->Wait();
+  }
+}
 
 ShardServer::~ShardServer() { Stop(); }
 

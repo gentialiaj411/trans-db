@@ -1,8 +1,15 @@
 #include "raft/raft_log.h"
 
+#include "txn/group_commit.h"
+#include "storage/status.h"
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -60,7 +67,10 @@ std::string SerializeRaftEntry(const RaftLogEntry& e) {
 
 }  // namespace
 
-RaftLog::RaftLog(std::string path) : path_(std::move(path)) { Load(); }
+RaftLog::RaftLog(std::string path) : path_(std::move(path)) {
+  Load();
+  (void)EnsureAppendFileOpen();
+}
 
 uint64_t RaftLog::Append(uint64_t term, RaftEntryType type, std::string payload) {
   std::scoped_lock lk(mu_);
@@ -74,6 +84,10 @@ uint64_t RaftLog::Append(uint64_t term, RaftEntryType type, std::string payload)
     return 0;
   }
   entries_.push_back(e);
+
+  if (!SyncFileLocked()) {
+    return 0;
+  }
   return idx;
 }
 
@@ -139,36 +153,42 @@ void RaftLog::TruncateFrom(uint64_t index) {
 }
 
 void RaftLog::AppendEntries(const std::vector<RaftLogEntry>& entries) {
-  std::scoped_lock lk(mu_);
   bool needs_rewrite = false;
-  for (const auto& in : entries) {
-    if (!entries_.empty()) {
-      const uint64_t cur_last = entries_.back().index;
-      if (in.index <= cur_last) {
-        const size_t off = static_cast<size_t>(in.index - entries_.front().index);
-        if (entries_[off].term != in.term) {
-          entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(off), entries_.end());
-          needs_rewrite = true;
-        } else {
-          continue;
+  {
+    std::scoped_lock lk(mu_);
+    for (const auto& in : entries) {
+      if (!entries_.empty()) {
+        const uint64_t cur_last = entries_.back().index;
+        if (in.index <= cur_last) {
+          const size_t off = static_cast<size_t>(in.index - entries_.front().index);
+          if (entries_[off].term != in.term) {
+            entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(off), entries_.end());
+            needs_rewrite = true;
+          } else {
+            continue;
+          }
         }
       }
-    }
-    const uint64_t expect = entries_.empty() ? 1u : (entries_.back().index + 1);
-    if (in.index != expect) {
-      continue;
-    }
-    if (needs_rewrite) {
-      entries_.push_back(in);
-    } else {
-      if (!AppendEntryToFile(in)) {
+      const uint64_t expect = entries_.empty() ? 1u : (entries_.back().index + 1);
+      if (in.index != expect) {
         continue;
       }
-      entries_.push_back(in);
+      if (needs_rewrite) {
+        entries_.push_back(in);
+      } else {
+        if (!AppendEntryToFile(in)) {
+          continue;
+        }
+        entries_.push_back(in);
+      }
     }
-  }
-  if (needs_rewrite) {
-    RewriteFileFromMemory();
+    if (needs_rewrite) {
+      RewriteFileFromMemory();
+      return;
+    }
+    if (!path_.empty()) {
+      (void)SyncFileLocked();
+    }
   }
 }
 
@@ -206,40 +226,90 @@ void RaftLog::Load() {
   }
 }
 
+bool RaftLog::EnsureAppendFileOpen() {
+  if (path_.empty()) {
+    return true;
+  }
+  if (ofs_.is_open()) {
+    return true;
+  }
+  ofs_.open(path_, std::ios::binary | std::ios::app);
+  if (!ofs_) {
+    return false;
+  }
+#ifdef _WIN32
+  if (sync_handle_ == INVALID_HANDLE_VALUE) {
+    sync_handle_ = CreateFileA(path_.c_str(),
+                               GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr,
+                               OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+  }
+#else
+  if (sync_fd_ < 0) {
+    sync_fd_ = ::open(path_.c_str(), O_WRONLY);
+  }
+#endif
+  return true;
+}
+
+bool RaftLog::SyncFileLocked() {
+  if (path_.empty()) {
+    return true;
+  }
+  if (!ofs_.is_open()) {
+    return false;
+  }
+  ofs_.flush();
+  if (!ofs_) {
+    return false;
+  }
+#ifdef _WIN32
+  if (sync_handle_ == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  return FlushFileBuffers(sync_handle_) != 0;
+#else
+  if (sync_fd_ < 0) {
+    return false;
+  }
+  return ::fsync(sync_fd_) == 0;
+#endif
+}
+
 bool RaftLog::AppendEntryToFile(const RaftLogEntry& entry) {
   if (path_.empty()) {
     return true;
   }
-  std::ofstream out(path_, std::ios::binary | std::ios::app);
-  if (!out) {
+  if (!EnsureAppendFileOpen()) {
     return false;
   }
   const std::string rec = SerializeRaftEntry(entry);
-  out.write(rec.data(), static_cast<std::streamsize>(rec.size()));
-  out.flush();
-  out.close();
-#ifdef _WIN32
-  {
-    HANDLE h = CreateFileA(path_.c_str(),
-                           GENERIC_WRITE,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           nullptr,
-                           OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL,
-                           nullptr);
-    if (h != INVALID_HANDLE_VALUE) {
-      FlushFileBuffers(h);
-      CloseHandle(h);
-    }
-  }
-#endif
-  return static_cast<bool>(out);
+  ofs_.write(rec.data(), static_cast<std::streamsize>(rec.size()));
+  return static_cast<bool>(ofs_);
 }
 
-bool RaftLog::RewriteFileFromMemory() const {
+bool RaftLog::RewriteFileFromMemory() {
   if (path_.empty()) {
     return true;
   }
+  if (ofs_.is_open()) {
+    ofs_.flush();
+    ofs_.close();
+  }
+#ifdef _WIN32
+  if (sync_handle_ != INVALID_HANDLE_VALUE) {
+    CloseHandle(sync_handle_);
+    sync_handle_ = INVALID_HANDLE_VALUE;
+  }
+#else
+  if (sync_fd_ >= 0) {
+    ::close(sync_fd_);
+    sync_fd_ = -1;
+  }
+#endif
   const std::string tmp = path_ + ".tmp";
   std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
   if (!out) {
@@ -268,10 +338,15 @@ bool RaftLog::RewriteFileFromMemory() const {
       CloseHandle(h);
     }
   }
-#endif
-  if (!out) {
-    return false;
+#else
+  {
+    const int fd = ::open(tmp.c_str(), O_WRONLY);
+    if (fd >= 0) {
+      (void)::fsync(fd);
+      ::close(fd);
+    }
   }
+#endif
   std::error_code ec;
   std::filesystem::rename(tmp, path_, ec);
   if (ec) {
@@ -283,7 +358,7 @@ bool RaftLog::RewriteFileFromMemory() const {
       return false;
     }
   }
-  return true;
+  return EnsureAppendFileOpen();
 }
 
 }  // namespace txndb

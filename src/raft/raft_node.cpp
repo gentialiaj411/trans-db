@@ -1,6 +1,8 @@
 #include "raft/raft_node.h"
+#include "raft/raft_transport.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #ifdef _WIN32
@@ -15,6 +17,31 @@
 #include <thread>
 
 namespace txndb {
+
+namespace {
+
+bool EnvEnabled(const char* name, bool defv) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) {
+    return defv;
+  }
+  return v[0] != '0';
+}
+
+uint64_t EnvU64(const char* name, uint64_t defv) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) {
+    return defv;
+  }
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(v, &end, 10);
+  if (end == v) {
+    return defv;
+  }
+  return static_cast<uint64_t>(parsed);
+}
+
+}  // namespace
 
 RaftNode::RaftNode(uint32_t node_id, std::vector<uint32_t> peer_ids, RaftTransport* transport,
                    ApplyCallback apply_cb)
@@ -37,7 +64,9 @@ RaftNode::RaftNode(uint32_t node_id, std::vector<uint32_t> peer_ids, RaftTranspo
   }
   last_heartbeat_recv_ = std::chrono::steady_clock::now();
   last_broadcast_ = last_heartbeat_recv_;
+  last_quorum_contact_ = last_heartbeat_recv_;
   RandomizeElectionTimeoutLocked();
+  LoadBatchingConfig();
 }
 
 RaftNode::~RaftNode() { Stop(); }
@@ -61,6 +90,7 @@ void RaftNode::BecomeFollower(uint64_t term) {
   leader_id_ = UINT32_MAX;
   RandomizeElectionTimeoutLocked();
   last_heartbeat_recv_ = std::chrono::steady_clock::now();
+  pending_proposals_.clear();
 }
 
 void RaftNode::BecomeCandidateLocked() {
@@ -80,9 +110,14 @@ void RaftNode::BecomeLeaderLocked() {
     next_index_[p] = log_.LastIndex() + 1;
     match_index_[p] = 0;
   }
+  last_quorum_contact_ = std::chrono::steady_clock::now();
   last_broadcast_ = std::chrono::steady_clock::time_point{};
   immediate_replicate_ = true;
-  log_.Append(current_term_, RaftEntryType::NOOP, "");
+  const uint64_t idx = log_.Append(current_term_, RaftEntryType::NOOP, "");
+  if (idx != 0 && IsBatchingEnabled()) {
+    pending_proposals_.push_back(idx);
+    proposal_cv_.notify_all();
+  }
 }
 
 void RaftNode::StartElection() {
@@ -201,6 +236,7 @@ void RaftNode::SendAppendEntriesToAll() {
   };
   std::vector<Job> jobs;
   uint64_t sent_term = 0;
+  int successful_peers = 0;
 
   {
     std::scoped_lock lk(mu_);
@@ -232,7 +268,24 @@ void RaftNode::SendAppendEntriesToAll() {
   for (Job& job : jobs) {
     AppendEntriesResponse resp =
         transport_->SendAppendEntries(job.peer, job.req);
+    if (resp.success) {
+      ++successful_peers;
+    }
     ProcessAppendEntriesResponse(job.peer, resp, sent_term);
+  }
+  {
+    std::scoped_lock lk(mu_);
+    if (!running_ || role_ != RaftRole::LEADER || current_term_ != sent_term) {
+      return;
+    }
+    const int quorum_replies = 1 + successful_peers;
+    const auto now = std::chrono::steady_clock::now();
+    if (quorum_replies >= MajorityThreshold()) {
+      last_quorum_contact_ = now;
+    } else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_quorum_contact_) >
+               election_timeout_) {
+      BecomeFollower(current_term_);
+    }
   }
 }
 
@@ -307,6 +360,9 @@ void RaftNode::Start() {
   RandomizeElectionTimeoutLocked();
   last_heartbeat_recv_ = std::chrono::steady_clock::now();
   tick_thread_ = std::make_unique<std::thread>([this] { TickLoop(); });
+  if (IsBatchingEnabled()) {
+    proposal_thread_ = std::make_unique<std::thread>([this] { ProposalBatchLoop(); });
+  }
 }
 
 void RaftNode::Stop() {
@@ -315,26 +371,40 @@ void RaftNode::Stop() {
     running_ = false;
   }
   cv_.notify_all();
+  proposal_cv_.notify_all();
   if (tick_thread_ && tick_thread_->joinable()) {
     tick_thread_->join();
     tick_thread_.reset();
+  }
+  if (proposal_thread_ && proposal_thread_->joinable()) {
+    proposal_thread_->join();
+    proposal_thread_.reset();
   }
 }
 
 uint64_t RaftNode::Propose(RaftEntryType type, std::string payload) {
   uint64_t idx = 0;
+  bool batching = false;
   {
     std::scoped_lock lk(mu_);
     if (role_ != RaftRole::LEADER) {
       return 0;
     }
     idx = log_.Append(current_term_, type, std::move(payload));
-    immediate_replicate_ = true;
-    cv_.notify_all();
+    if (idx == 0) {
+      return 0;
+    }
+    batching = IsBatchingEnabled();
+    if (batching) {
+      pending_proposals_.push_back(idx);
+      proposal_cv_.notify_all();
+    } else {
+      immediate_replicate_ = true;
+      cv_.notify_all();
+    }
   }
-  std::thread([this]() { this->SendAppendEntriesToAll(); }).detach();
-  if (idx == 0) {
-    return 0;
+  if (!batching) {
+    SendAppendEntriesToAll();
   }
   return idx;
 }
@@ -440,6 +510,70 @@ const RaftLog& RaftNode::GetLog() const { return log_; }
 bool RaftNode::WaitForCommit(uint64_t index, std::chrono::milliseconds timeout) {
   std::unique_lock lk(mu_);
   return cv_.wait_for(lk, timeout, [this, index] { return last_applied_ >= index; });
+}
+
+bool RaftNode::IsBatchingEnabled() const { return raft_batch_enabled_; }
+
+void RaftNode::LoadBatchingConfig() {
+  const char* batch_env = std::getenv("TRANS_DB_RAFT_BATCH_ENABLED");
+  raft_batch_enabled_ = EnvEnabled("TRANS_DB_RAFT_BATCH_ENABLED", true);
+  if (batch_env == nullptr && dynamic_cast<InProcessTransport*>(transport_) != nullptr) {
+    raft_batch_enabled_ = false;
+  }
+  raft_batch_max_ = static_cast<size_t>(std::max<uint64_t>(1, EnvU64("TRANS_DB_RAFT_BATCH_MAX", 32)));
+  raft_batch_window_ =
+      std::chrono::microseconds(std::max<uint64_t>(1, EnvU64("TRANS_DB_RAFT_BATCH_WINDOW_US", 500)));
+}
+
+bool RaftNode::FlushPendingProposals(bool force) {
+  bool should_flush = false;
+  {
+    std::scoped_lock lk(mu_);
+    if (!running_ || role_ != RaftRole::LEADER || pending_proposals_.empty()) {
+      return false;
+    }
+    if (!force && pending_proposals_.size() < raft_batch_max_) {
+      return false;
+    }
+    pending_proposals_.clear();
+    immediate_replicate_ = true;
+    should_flush = true;
+  }
+  if (should_flush) {
+    SendAppendEntriesToAll();
+  }
+  return should_flush;
+}
+
+void RaftNode::ProposalBatchLoop() {
+  while (true) {
+    std::unique_lock lk(mu_);
+    proposal_cv_.wait(lk, [this] { return !running_ || !pending_proposals_.empty(); });
+    if (!running_) {
+      break;
+    }
+    if (role_ != RaftRole::LEADER || pending_proposals_.empty()) {
+      continue;
+    }
+    if (pending_proposals_.size() >= raft_batch_max_) {
+      lk.unlock();
+      (void)FlushPendingProposals(true);
+      continue;
+    }
+    const auto window = raft_batch_window_;
+    const bool hit_window = proposal_cv_.wait_for(lk, window, [this] {
+      return !running_ || role_ != RaftRole::LEADER || pending_proposals_.size() >= raft_batch_max_;
+    });
+    if (!running_) {
+      break;
+    }
+    if (role_ != RaftRole::LEADER || pending_proposals_.empty()) {
+      continue;
+    }
+    const bool force = !hit_window || pending_proposals_.size() >= raft_batch_max_;
+    lk.unlock();
+    (void)FlushPendingProposals(force);
+  }
 }
 
 void RaftNode::LoadMeta() {

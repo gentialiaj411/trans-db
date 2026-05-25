@@ -13,6 +13,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <deque>
 #include <unordered_map>
 #include <vector>
 
@@ -97,6 +98,10 @@ private:
   void BecomeLeaderLocked();
   void StartElection();
   void SendAppendEntriesToAll();
+  void ProposalBatchLoop();
+  bool FlushPendingProposals(bool force);
+  bool IsBatchingEnabled() const;
+  void LoadBatchingConfig();
   void ProcessAppendEntriesResponse(uint32_t peer_id, const AppendEntriesResponse& resp,
                                     uint64_t sent_term);
   void AdvanceCommitIndexLocked();
@@ -127,14 +132,21 @@ private:
 
   std::chrono::steady_clock::time_point last_heartbeat_recv_;
   std::chrono::steady_clock::time_point last_broadcast_;
+  std::chrono::steady_clock::time_point last_quorum_contact_;
   std::chrono::milliseconds election_timeout_{250};
   std::mt19937 rng_;
 
   mutable std::mutex mu_;
   std::condition_variable cv_;
+  std::condition_variable proposal_cv_;
   std::atomic<bool> running_{false};
   std::unique_ptr<std::thread> tick_thread_;
+  std::unique_ptr<std::thread> proposal_thread_;
   bool immediate_replicate_{false};
+  std::deque<uint64_t> pending_proposals_;
+  bool raft_batch_enabled_{true};
+  size_t raft_batch_max_{32};
+  std::chrono::microseconds raft_batch_window_{500};
 
   static constexpr auto kHeartbeatInterval = std::chrono::milliseconds(50);
   static constexpr auto kElectionTimeoutMin = std::chrono::milliseconds(150);

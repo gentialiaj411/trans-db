@@ -1,0 +1,55 @@
+syntax = "proto3";
+package txndb.raft;
+
+service RaftService {
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+message RaftLogEntryMsg {
+    uint64 index = 1;
+    uint64 term = 2;
+    uint32 entry_type = 3;
+    bytes payload = 4;
+}
+
+message AppendEntriesRequest {
+    uint64 term = 1;
+    uint32 leader_id = 2;
+    uint64 prev_log_index = 3;
+    uint64 prev_log_term = 4;
+    repeated RaftLogEntryMsg entries = 5;
+    uint64 leader_commit = 6;
+}
+
+message AppendEntriesResponse {
+    uint64 term = 1;
+    bool success = 2;
+    uint64 match_index = 3;
+}
+
+message RequestVoteRequest {
+    uint64 term = 1;
+    uint32 candidate_id = 2;
+    uint64 last_log_index = 3;
+    uint64 last_log_term = 4;
+}
+
+message RequestVoteResponse {
+    uint64 term = 1;
+    bool vote_granted = 2;
+}
+
+message InstallSnapshotRequest {
+    uint64 term = 1;
+    uint32 leader_id = 2;
+    uint64 last_included_index = 3;
+    uint64 last_included_term = 4;
+    bytes data = 5;
+}
+
+message InstallSnapshotResponse {
+    uint64 term = 1;
+    bool success = 2;
+}

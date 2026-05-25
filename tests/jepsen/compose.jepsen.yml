@@ -1,0 +1,25 @@
+# Overlay for Jepsen runner + optional duplicate-append fault on Raft leaders.
+services:
+  shard0-rep0:
+    environment:
+      TRANS_DB_RAFT_DUPLICATE_APPEND: ${TRANS_DB_RAFT_DUPLICATE_APPEND:-}
+  shard1-rep0:
+    environment:
+      TRANS_DB_RAFT_DUPLICATE_APPEND: ${TRANS_DB_RAFT_DUPLICATE_APPEND:-}
+  shard2-rep0:
+    environment:
+      TRANS_DB_RAFT_DUPLICATE_APPEND: ${TRANS_DB_RAFT_DUPLICATE_APPEND:-}
+
+  jepsen-runner:
+    build:
+      context: ../..
+      dockerfile: tests/jepsen/Dockerfile
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../..:/workspace
+    working_dir: /workspace
+    depends_on:
+      - shard0-rep0
+      - shard1-rep0
+      - shard2-rep0
